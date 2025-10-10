@@ -1,11 +1,12 @@
 # main_web.py
 # A Discord RSS bot with a multi-page web interface for configuration.
-# This version includes a secure, first-time setup admin login system.
+# This version is for the web UI only. The scheduler runs as a separate process.
 
 import os
 import json
 import uuid
 import yaml
+from datetime import datetime, timezone
 from flask import Flask, render_template_string, request, redirect, url_for, flash, get_flashed_messages, send_file, session, g
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -22,6 +23,27 @@ SENT_ARTICLES_FILE = "sent_articles.yaml"
 FEED_STATE_FILE = "feed_state.json"
 USER_FILE = "user.json" # Stores the admin user's credentials
 SECRET_KEY_FILE = "secret.key" # Stores the Flask secret key
+
+# --- Helper function for human-readable time ---
+def time_ago(dt_str):
+    if not dt_str:
+        return "never"
+    dt = datetime.fromisoformat(dt_str)
+    now = datetime.now(timezone.utc)
+    diff = now - dt
+    
+    seconds = diff.total_seconds()
+    if seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)} minutes ago"
+    elif seconds < 86400:
+        return f"{int(seconds / 3600)} hours ago"
+    else:
+        return f"{int(seconds / 86400)} days ago"
+
+# Make the helper function available in templates
+app.jinja_env.globals.update(time_ago=time_ago)
 
 # --- HTML Templates ---
 
@@ -40,7 +62,7 @@ LAYOUT_TEMPLATE = """
     <style> body { font-family: 'Inter', sans-serif; } </style>
 </head>
 <body class="bg-gray-900 text-white">
-    <div class="container mx-auto p-4 md:p-8 max-w-6xl">
+    <div class="container mx-auto p-4 md:p-8 max-w-7xl">
         <div class="flex justify-between items-center mb-2">
             <h1 class="text-3xl font-bold text-center flex-grow">Discord RSS Bot Control Panel</h1>
             {% if g.user %}
@@ -125,10 +147,11 @@ VIEW_FEEDS_TEMPLATE = """
         <table class="min-w-full text-left text-sm font-light">
             <thead class="border-b border-gray-600 font-medium">
                 <tr>
-                    <th scope="col" class="px-6 py-4">Status</th>
-                    <th scope="col" class="px-6 py-4">Server/Channel</th>
+                    <th scope="col" class="px-6 py-4">Feed Status</th>
+                    <th scope="col" class="px-6 py-4">Last Post Status</th>
+                    <th scope="col" class="px-6 py-4">RSS Name</th>
                     <th scope="col" class="px-6 py-4">Feed URL</th>
-                    <th scope="col" class="px-6 py-4">Webhook URL</th>
+                    <th scope="col" class="px-6 py-4">Webhook Destinations</th>
                     <th scope="col" class="px-6 py-4">Interval (s)</th>
                     <th scope="col" class="px-6 py-4">Actions</th>
                 </tr>
@@ -137,23 +160,47 @@ VIEW_FEEDS_TEMPLATE = """
                 {% for feed in config.FEEDS %}
                 {% set state = feed_state.get(feed.id, {}) %}
                 {% set status_code = state.get('status_code') %}
+                {% set last_post = state.get('last_post', {}) %}
+                {% set post_status = last_post.get('status') %}
+                {% set post_time = last_post.get('timestamp') %}
                 <tr class="border-b border-gray-700">
                     <td class="px-6 py-4 font-bold">
                         {% if status_code %}
                             {% if 200 <= status_code < 300 %}
-                                <span class="text-green-400">{{ status_code }}</span>
+                                <span class="text-green-400">{{ status_code }} OK</span>
                             {% elif 300 <= status_code < 400 %}
-                                <span class="text-yellow-400">{{ status_code }}</span>
+                                <span class="text-yellow-400">{{ status_code }} Redirect</span>
                             {% else %}
-                                <span class="text-red-400">{{ status_code }}</span>
+                                <span class="text-red-400">{{ status_code }} Error</span>
                             {% endif %}
                         {% else %}
-                            <span class="text-gray-500">N/A</span>
+                            <span class="text-gray-500">Pending</span>
                         {% endif %}
                     </td>
-                    <td class="px-6 py-4 text-gray-300 truncate" style="max-width: 200px;">{{ feed.get('name', 'Not Set') }}</td>
-                    <td class="px-6 py-4 font-mono text-xs truncate" style="max-width: 250px;">{{ feed.url }}</td>
-                    <td class="px-6 py-4 font-mono text-xs truncate" style="max-width: 250px;">{{ feed.webhook_url }}</td>
+                    <td class="px-6 py-4">
+                        {% if post_status %}
+                            {% if post_status == 'Success' %}
+                                <span class="text-green-400 font-semibold">{{ post_status }}</span>
+                            {% elif post_status == 'Rate Limited' %}
+                                <span class="text-yellow-400 font-semibold">{{ post_status }}</span>
+                            {% else %}
+                                <span class="text-red-400 font-semibold">{{ post_status }}</span>
+                            {% endif %}
+                            <p class="text-gray-500 text-xs">{{ time_ago(post_time) }}</p>
+                        {% else %}
+                            <span class="text-gray-500">No posts yet</span>
+                        {% endif %}
+                    </td>
+                    <td class="px-6 py-4 text-gray-300 truncate" style="max-width: 250px;">{{ feed.get('name', 'Not Set') }}</td>
+                    <td class="px-6 py-4 font-mono text-xs truncate" style="max-width: 300px;">{{ feed.url }}</td>
+                    <td class="px-6 py-4 text-xs text-gray-400">
+                        {% set webhooks = feed.get('webhooks', []) %}
+                        {% if webhooks %}
+                            {{ webhooks|map(attribute='label')|join(', ') }}
+                        {% else %}
+                            {{ feed.get('webhook_urls', [])|length }} legacy URL(s)
+                        {% endif %}
+                    </td>
                     <td class="px-6 py-4">{{ feed.update_interval }}</td>
                     <td class="px-6 py-4 flex items-center space-x-4">
                         <a href="{{ url_for('edit_feed', feed_id=feed.id) }}" class="text-indigo-400 hover:text-indigo-300">Edit</a>
@@ -164,7 +211,7 @@ VIEW_FEEDS_TEMPLATE = """
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="6" class="text-center py-8 text-gray-400">No feeds configured. <a href="{{ url_for('add_feed') }}" class="text-indigo-400 hover:underline">Add one now!</a></td>
+                    <td colspan="7" class="text-center py-8 text-gray-400">No feeds configured. <a href="{{ url_for('add_feed') }}" class="text-indigo-400 hover:underline">Add one now!</a></td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -173,21 +220,47 @@ VIEW_FEEDS_TEMPLATE = """
 </div>
 """
 
+FORM_TEMPLATE_SHARED_SCRIPT = """
+<script>
+    function addWebhookRow() {
+        const container = document.getElementById('webhook-container');
+        const newRow = document.createElement('div');
+        newRow.className = 'flex items-center space-x-2 mb-2';
+        newRow.innerHTML = `
+            <input type="url" name="webhook_url" placeholder="Webhook URL" class="flex-grow shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
+            <input type="text" name="webhook_label" placeholder="Label (e.g., Server - #channel)" class="w-1/3 shadow appearance-none border border-gray-700 rounded-lg py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
+            <button type="button" onclick="this.parentElement.remove()" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-2 rounded-lg" title="Remove Webhook">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16">
+                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                </svg>
+            </button>
+        `;
+        container.appendChild(newRow);
+    }
+</script>
+"""
+
 ADD_FEED_TEMPLATE = """
 <div class="bg-gray-800 p-6 rounded-xl shadow-lg">
     <h2 class="text-2xl font-semibold mb-4">Add a New Feed</h2>
     <form action="{{ url_for('add_feed') }}" method="post">
         <div class="mb-4">
-            <label for="name" class="block text-gray-300 text-sm font-bold mb-2">Server/Channel Name (Optional)</label>
-            <input type="text" name="name" id="name" placeholder="e.g., My Server - #announcements" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
+            <label for="name" class="block text-gray-300 text-sm font-bold mb-2">RSS Name (Optional)</label>
+            <input type="text" name="name" id="name" placeholder="e.g., Tech News" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
         </div>
         <div class="mb-4">
             <label for="url" class="block text-gray-300 text-sm font-bold mb-2">RSS Feed URL</label>
             <input type="url" name="url" id="url" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
         </div>
         <div class="mb-4">
-            <label for="webhook_url" class="block text-gray-300 text-sm font-bold mb-2">Discord Webhook URL</label>
-            <input type="url" name="webhook_url" id="webhook_url" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
+            <label class="block text-gray-300 text-sm font-bold mb-2">Discord Webhook Destinations</label>
+            <div id="webhook-container">
+                <!-- Dynamic rows will be inserted here -->
+            </div>
+            <button type="button" onclick="addWebhookRow()" class="mt-2 text-sm bg-gray-700 hover:bg-gray-600 text-indigo-400 font-bold py-2 px-4 rounded-lg focus:outline-none focus:shadow-outline transition-colors duration-200">
+                + Add Webhook
+            </button>
         </div>
         <div class="mb-6">
             <label for="update_interval" class="block text-gray-300 text-sm font-bold mb-2">Refresh Interval (seconds)</label>
@@ -198,6 +271,13 @@ ADD_FEED_TEMPLATE = """
         </button>
     </form>
 </div>
+{{ FORM_TEMPLATE_SHARED_SCRIPT | safe }}
+<script>
+    // Add one row by default on page load for a new feed
+    document.addEventListener('DOMContentLoaded', function() {
+        addWebhookRow();
+    });
+</script>
 """
 
 EDIT_FEED_TEMPLATE = """
@@ -205,16 +285,29 @@ EDIT_FEED_TEMPLATE = """
     <h2 class="text-2xl font-semibold mb-4">Edit Feed</h2>
     <form action="{{ url_for('edit_feed', feed_id=feed.id) }}" method="post">
         <div class="mb-4">
-            <label for="name" class="block text-gray-300 text-sm font-bold mb-2">Server/Channel Name (Optional)</label>
-            <input type="text" name="name" id="name" value="{{ feed.get('name', '') }}" placeholder="e.g., My Server - #announcements" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
+            <label for="name" class="block text-gray-300 text-sm font-bold mb-2">RSS Name (Optional)</label>
+            <input type="text" name="name" id="name" value="{{ feed.get('name', '') }}" placeholder="e.g., Tech News" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
         </div>
         <div class="mb-4">
             <label for="url" class="block text-gray-300 text-sm font-bold mb-2">RSS Feed URL</label>
             <input type="url" name="url" id="url" value="{{ feed.url }}" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
         </div>
         <div class="mb-4">
-            <label for="webhook_url" class="block text-gray-300 text-sm font-bold mb-2">Discord Webhook URL</label>
-            <input type="url" name="webhook_url" id="webhook_url" value="{{ feed.webhook_url }}" class="shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
+            <label class="block text-gray-300 text-sm font-bold mb-2">Discord Webhook Destinations</label>
+            <div id="webhook-container">
+                {% for webhook in feed.get('webhooks', []) %}
+                <div class="flex items-center space-x-2 mb-2">
+                    <input type="url" name="webhook_url" placeholder="Webhook URL" value="{{ webhook.url }}" class="flex-grow shadow appearance-none border border-gray-700 rounded-lg w-full py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500" required>
+                    <input type="text" name="webhook_label" placeholder="Label (e.g., Server - #channel)" value="{{ webhook.label }}" class="w-1/3 shadow appearance-none border border-gray-700 rounded-lg py-2 px-3 bg-gray-700 text-gray-200 leading-tight focus:outline-none focus:shadow-outline focus:border-indigo-500">
+                    <button type="button" onclick="this.parentElement.remove()" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-2 rounded-lg" title="Remove Webhook">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-trash" viewBox="0 0 16 16"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/></svg>
+                    </button>
+                </div>
+                {% endfor %}
+            </div>
+            <button type="button" onclick="addWebhookRow()" class="mt-2 text-sm bg-gray-700 hover:bg-gray-600 text-indigo-400 font-bold py-2 px-4 rounded-lg focus:outline-none focus:shadow-outline transition-colors duration-200">
+                + Add Webhook
+            </button>
         </div>
         <div class="mb-6">
             <label for="update_interval" class="block text-gray-300 text-sm font-bold mb-2">Refresh Interval (seconds)</label>
@@ -228,13 +321,13 @@ EDIT_FEED_TEMPLATE = """
         </div>
     </form>
 </div>
+{{ FORM_TEMPLATE_SHARED_SCRIPT | safe }}
 """
 
 BACKUP_RESTORE_TEMPLATE = """
 <div class="bg-gray-800 p-6 rounded-xl shadow-lg">
     <h2 class="text-2xl font-semibold mb-4">Backup & Restore</h2>
     <p class="text-gray-400 mb-6">Download your current feed configuration or restore from a backup file.</p>
-
     <div class="mb-6">
         <h3 class="text-lg font-medium mb-2">Download Backup</h3>
         <p class="text-gray-400 text-sm mb-3">Saves a copy of your `config.json` file containing all your feeds.</p>
@@ -242,9 +335,7 @@ BACKUP_RESTORE_TEMPLATE = """
             Download config.json
         </a>
     </div>
-
     <hr class="border-gray-700 my-6">
-
     <div>
         <h3 class="text-lg font-medium mb-2">Restore from Backup</h3>
         <p class="text-gray-400 text-sm mb-3">Upload a `config.json` file to restore your feeds. This will overwrite your current configuration.</p>
@@ -268,7 +359,8 @@ TEMPLATES = {
     "edit_feed": EDIT_FEED_TEMPLATE,
     "backup_restore": BACKUP_RESTORE_TEMPLATE,
     "setup": SETUP_TEMPLATE,
-    "login": LOGIN_TEMPLATE
+    "login": LOGIN_TEMPLATE,
+    "form_shared_script": FORM_TEMPLATE_SHARED_SCRIPT
 }
 
 # --- Configuration and State Management ---
@@ -342,11 +434,9 @@ def load_logged_in_user():
 
 @app.before_request
 def require_login_or_setup():
-    # Allow access to setup if no admin exists
     if not admin_user_exists() and request.endpoint != 'setup':
         return redirect(url_for('setup'))
     
-    # If admin exists, require login for all pages except login/setup
     if admin_user_exists() and g.user is None and request.endpoint not in ['login', 'setup']:
         return redirect(url_for('login'))
 
@@ -362,7 +452,7 @@ def setup():
         password = request.form['password']
         
         user_data = {
-            "id": 1, # Static ID for the single admin user
+            "id": 1,
             "username": username,
             "password": generate_password_hash(password)
         }
@@ -384,7 +474,7 @@ def login():
         username = request.form['username']
         password = request.form['password']
         user = get_admin_user()
-        error = "Invalid username or password." # Generic error for security
+        error = "Invalid username or password."
 
         if user and user.get('username') == username and check_password_hash(user.get('password', ''), password):
             session.clear()
@@ -413,20 +503,28 @@ def view_feeds():
 def add_feed():
     if request.method == 'POST':
         config = load_config()
+        webhook_urls = request.form.getlist('webhook_url')
+        webhook_labels = request.form.getlist('webhook_label')
+        
+        webhooks_data = [
+            {"url": url, "label": label}
+            for url, label in zip(webhook_urls, webhook_labels) if url
+        ]
+
         new_feed = {
             "id": str(uuid.uuid4()),
             "name": request.form['name'],
             "url": request.form['url'],
-            "webhook_url": request.form['webhook_url'],
+            "webhooks": webhooks_data,
             "update_interval": int(request.form['update_interval'])
         }
         config['FEEDS'].append(new_feed)
         save_config(config)
-        flash(f'Feed "{new_feed["url"]}" added! The scheduler will perform an initial check on its next cycle.', 'success')
+        flash(f'Feed "{new_feed["url"]}" added successfully!', 'success')
         return redirect(url_for('view_feeds'))
     
     full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["add_feed"])
-    return render_template_string(full_html)
+    return render_template_string(full_html, FORM_TEMPLATE_SHARED_SCRIPT=TEMPLATES["form_shared_script"])
 
 @app.route('/edit/<feed_id>', methods=['GET', 'POST'])
 def edit_feed(feed_id):
@@ -437,13 +535,28 @@ def edit_feed(feed_id):
         flash('Feed not found.', 'error')
         return redirect(url_for('view_feeds'))
 
+    # Handle legacy format for backward compatibility
+    if 'webhook_urls' in feed_to_edit and 'webhooks' not in feed_to_edit:
+        feed_to_edit['webhooks'] = [{"url": url, "label": ""} for url in feed_to_edit['webhook_urls']]
+
     if request.method == 'POST':
+        webhook_urls = request.form.getlist('webhook_url')
+        webhook_labels = request.form.getlist('webhook_label')
+        
+        webhooks_data = [
+            {"url": url, "label": label}
+            for url, label in zip(webhook_urls, webhook_labels) if url
+        ]
+
         for i, feed in enumerate(config['FEEDS']):
             if feed['id'] == feed_id:
                 config['FEEDS'][i]['name'] = request.form['name']
                 config['FEEDS'][i]['url'] = request.form['url']
-                config['FEEDS'][i]['webhook_url'] = request.form['webhook_url']
+                config['FEEDS'][i]['webhooks'] = webhooks_data
                 config['FEEDS'][i]['update_interval'] = int(request.form['update_interval'])
+                # Clean up legacy fields if they exist
+                config['FEEDS'][i].pop('webhook_url', None)
+                config['FEEDS'][i].pop('webhook_urls', None)
                 break
         
         save_config(config)
@@ -451,7 +564,7 @@ def edit_feed(feed_id):
         return redirect(url_for('view_feeds'))
 
     full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["edit_feed"])
-    return render_template_string(full_html, feed=feed_to_edit)
+    return render_template_string(full_html, feed=feed_to_edit, FORM_TEMPLATE_SHARED_SCRIPT=TEMPLATES["form_shared_script"])
 
 @app.route('/delete/<feed_id>', methods=['POST'])
 def delete_feed(feed_id):
@@ -488,9 +601,7 @@ def upload_backup():
     if file and file.filename.endswith('.json'):
         try:
             content = file.read().decode('utf-8')
-            # Validate that it's a valid JSON file
             json.loads(content)
-            # Overwrite the config file
             with open(CONFIG_FILE, 'w') as f:
                 f.write(content)
             flash('Configuration restored successfully!', 'success')
