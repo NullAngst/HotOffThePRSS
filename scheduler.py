@@ -1,209 +1,243 @@
 # scheduler.py
-# This is a dedicated script to run the background feed checker.
+# This script is a dedicated background process for fetching and posting RSS feeds.
+# It's designed to be run as a standalone service.
 
 import os
-import asyncio
-import feedparser
-import yaml
 import json
-import threading
-import requests
+import yaml
 import time
-from datetime import datetime, timezone, timedelta
+import uuid
+import feedparser
+import requests
+from datetime import datetime, timedelta, timezone
+
+# --- Set a common User-Agent for all requests ---
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0"
+feedparser.USER_AGENT = USER_AGENT
 
 # --- Configuration & State Files ---
 CONFIG_FILE = "config.json"
 SENT_ARTICLES_FILE = "sent_articles.yaml"
 FEED_STATE_FILE = "feed_state.json"
-MAX_SENT_ARTICLES = 10000 # The maximum number of article IDs to store.
 
-# --- Threading Lock ---
-# This lock prevents race conditions when multiple threads access the sent_articles file.
-file_lock = threading.Lock()
-
-# --- Set a common User-Agent for all feedparser requests ---
-feedparser.USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0"
-
-def initialize_files():
-    """Ensure all necessary files exist before the app starts."""
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump({"FEEDS": []}, f)
-        print(f"Created default {CONFIG_FILE}")
-    if not os.path.exists(SENT_ARTICLES_FILE):
-        with open(SENT_ARTICLES_FILE, 'w') as f:
-            yaml.dump([], f)
-        print(f"Created default {SENT_ARTICLES_FILE}")
-    if not os.path.exists(FEED_STATE_FILE):
-        with open(FEED_STATE_FILE, 'w') as f:
-            json.dump({}, f)
-        print(f"Created default {FEED_STATE_FILE}")
+# --- Data Loading and Saving Functions ---
 
 def load_config():
-    with open(CONFIG_FILE, 'r') as f:
-        content = f.read()
-        if not content:
-            return {"FEEDS": []}
-        return json.loads(content)
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"FEEDS": []}
 
-def save_feed_state(feed_state):
-     with open(FEED_STATE_FILE, 'w') as f:
-        json.dump(feed_state, f, indent=4)
+def load_sent_articles():
+    try:
+        with open(SENT_ARTICLES_FILE, 'r') as f:
+            return set(yaml.safe_load(f) or [])
+    except FileNotFoundError:
+        return set()
+
+def save_sent_articles(sent_ids):
+    # Prune the list to the 10,000 most recent entries to prevent infinite growth
+    with open(SENT_ARTICLES_FILE, 'w') as f:
+        yaml.dump(list(sent_ids)[-10000:], f)
 
 def load_feed_state():
-    with open(FEED_STATE_FILE, 'r') as f:
-        content = f.read()
-        if not content:
-            return {}
-        return json.loads(content)
+    try:
+        with open(FEED_STATE_FILE, 'r') as f:
+            content = f.read()
+            if not content: return {}
+            return json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-def post_if_new(article_id, entry, feed_data, webhook_url):
-    """
-    Atomically checks if an article is new and posts it as an embed if so.
-    """
-    with file_lock:
-        sent_articles_list = []
-        try:
-            with open(SENT_ARTICLES_FILE, 'r') as f:
-                content = f.read()
-                if content:
-                    sent_articles_list = yaml.safe_load(content) or []
-        except FileNotFoundError:
-            pass
+def save_feed_state(state_data):
+    with open(FEED_STATE_FILE, 'w') as f:
+        json.dump(state_data, f, indent=4)
 
-        sent_articles_set = set(sent_articles_list)
+# --- Core Logic ---
 
-        if article_id not in sent_articles_set:
-            print(f"New article found, posting: {entry.title}")
-            
-            # Create the Discord embed payload
-            description = entry.get('summary', 'No description available.')
-            # Simple HTML tag removal and truncation
-            description = description.split('<')[0]
-            if len(description) > 400:
-                description = description[:400].rsplit(' ', 1)[0] + '...'
+def send_to_webhook(webhook_url, embed):
+    """Sends a rich embed to a Discord webhook."""
+    headers = {"Content-Type": "application/json"}
+    payload = {"embeds": [embed]}
+    try:
+        response = requests.post(webhook_url, headers=headers, json=payload, timeout=10)
+        if response.status_code in [200, 204]:
+            return "Success"
+        elif response.status_code == 429:
+            print(f"Rate limited by Discord for webhook {webhook_url}. Retrying...")
+            return "Rate Limited"
+        else:
+            print(f"Error sending to webhook {webhook_url}: {response.status_code} - {response.text}")
+            return f"Error: {response.status_code}"
+    except requests.RequestException as e:
+        print(f"Failed to connect to webhook {webhook_url}: {e}")
+        return "Failed to Connect"
 
-            embed = {
-                "title": entry.get('title', 'No Title'),
-                "url": entry.get('link', ''),
-                "description": description,
-                "color": 5814783,  # A nice blue color (#58A6FF)
-                "footer": {
-                    "text": feed_data.feed.title
-                },
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            payload = {"embeds": [embed]}
+def check_single_feed(feed_config, sent_articles):
+    """Checks a single feed for new articles and posts them."""
+    feed_url = feed_config.get("url")
+    feed_id = feed_config.get("id")
+    
+    headers = {"User-Agent": USER_AGENT}
+    feed_data = feedparser.parse(feed_url, request_headers=headers)
+    
+    status_code = feed_data.get('status', 500)
+    last_post_status = None
+    
+    if not feed_data.entries:
+        if status_code != 200:
+            print(f"Could not fetch feed: {feed_url} (Status: {status_code})")
+        return [], status_code, last_post_status
 
-            response = requests.post(webhook_url, json=payload)
-            
-            if response.status_code < 400:
-                sent_articles_list.append(article_id)
-                if len(sent_articles_list) > MAX_SENT_ARTICLES:
-                    sent_articles_list = sent_articles_list[-MAX_SENT_ARTICLES:]
-                
-                with open(SENT_ARTICLES_FILE, 'w') as f:
-                    yaml.dump(sent_articles_list, f)
-                return True
-            else:
-                print(f"Error sending embed to webhook: {response.status_code} {response.text}")
-                return False
-        return False
+    now = datetime.now(timezone.utc)
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    
+    # Filter articles published within the last 24 hours
+    recent_articles = []
+    for entry in feed_data.entries:
+        published_time = entry.get('published_parsed')
+        if published_time:
+            published_dt = datetime.fromtimestamp(time.mktime(published_time)).replace(tzinfo=timezone.utc)
+            if published_dt >= twenty_four_hours_ago:
+                recent_articles.append(entry)
+
+    if not recent_articles:
+        return [], status_code, last_post_status
+
+    # Sort to ensure the newest is first
+    recent_articles.sort(key=lambda x: x.get('published_parsed', (0,)*9), reverse=True)
+    
+    # Check if this feed has ever been checked before
+    feed_state = load_feed_state()
+    is_initial_check = feed_id not in feed_state
+    
+    new_articles_to_post = []
+    if is_initial_check:
+        # On first check, only post the single newest article
+        newest_article = recent_articles[0]
+        new_articles_to_post.append(newest_article)
+        
+        # Then, silently add all other recent articles to memory to prevent them from being posted
+        for article in recent_articles:
+            article_id = article.get('id') or article.get('link')
+            if article_id:
+                sent_articles.add(article_id)
+        print(f"Initial check for '{feed_url}'. Seeding memory with {len(recent_articles)} articles and posting 1.")
+    else:
+        # On subsequent checks, find all articles not in memory
+        for entry in recent_articles:
+            article_id = entry.get('id') or entry.get('link')
+            if article_id and article_id not in sent_articles:
+                new_articles_to_post.append(entry)
+
+    # Post the new articles
+    posted_ids = []
+    for entry in reversed(new_articles_to_post): # Post oldest first
+        article_id = entry.get('id') or entry.get('link')
+        if not article_id: continue
+        
+        title = entry.get('title', 'No Title')
+        link = entry.get('link', '')
+        summary = entry.get('summary', 'No summary available.')
+        
+        # Clean up summary (basic HTML tag removal)
+        import re
+        summary = re.sub('<[^<]+?>', '', summary)
+        summary = summary.strip()
+        if len(summary) > 250:
+            summary = summary[:247] + "..."
+
+        embed = {
+            "title": title,
+            "url": link,
+            "description": summary,
+            "color": 5814783, # A nice blue color
+            "footer": {"text": f"From: {feed_config.get('name', feed_url)}"}
+        }
+
+        # Handle different webhook structures for backward compatibility
+        webhooks = feed_config.get('webhooks', [])
+        if not webhooks and 'webhook_url' in feed_config: # Legacy single URL
+            webhooks = [{"url": feed_config['webhook_url'], "label": ""}]
+        
+        for webhook in webhooks:
+            webhook_url = webhook.get("url")
+            if webhook_url:
+                post_status = send_to_webhook(webhook_url, embed)
+                # Keep track of the status of the last attempt
+                last_post_status = post_status
+
+        # Mark as posted only after attempting all webhooks for it
+        posted_ids.append(article_id)
+
+    return posted_ids, status_code, last_post_status
+
+# --- Main Scheduler Class ---
 
 class FeedScheduler:
-    def __init__(self):
-        self._is_running = True
-
-    def stop(self):
-        self._is_running = False
+    def __init__(self, interval=60):
+        self.interval = interval
 
     def run(self):
         print("Scheduler started.")
-        while self._is_running:
+        while True:
             print("Scheduler running check...")
             config = load_config()
+            sent_articles = load_sent_articles()
             feed_state = load_feed_state()
             now = datetime.now(timezone.utc)
-
+            state_changed = False
+            
             for feed_config in config.get("FEEDS", []):
-                feed_id = feed_config['id']
-                state_entry = feed_state.get(feed_id, {})
-                last_checked_str = state_entry.get('last_checked')
-                last_checked = datetime.fromisoformat(last_checked_str) if last_checked_str else None
+                feed_id = feed_config.get("id")
+                if not feed_id: continue
+
+                last_checked_str = feed_state.get(feed_id, {}).get('last_checked')
+                update_interval = feed_config.get("update_interval", 300)
+
+                should_check = True
+                if last_checked_str:
+                    last_checked = datetime.fromisoformat(last_checked_str)
+                    if now - last_checked < timedelta(seconds=update_interval):
+                        should_check = False
                 
-                is_initial_check = not last_checked
+                if should_check:
+                    print(f"Checking feed: {feed_config.get('url')}")
+                    
+                    # Ensure the state dict for this feed exists
+                    if feed_id not in feed_state:
+                        feed_state[feed_id] = {}
 
-                if is_initial_check or (now - last_checked).total_seconds() >= feed_config['update_interval']:
-                    print(f"Processing feed: {feed_config['url']}")
-                    threading.Thread(target=self.check_single_feed, args=(feed_config, is_initial_check), daemon=True).start()
+                    try:
+                        newly_posted_ids, status_code, last_post_status = check_single_feed(feed_config, sent_articles)
+                        
+                        feed_state[feed_id]['status_code'] = status_code
+                        feed_state[feed_id]['last_checked'] = now.isoformat()
+                        
+                        # If a post was attempted, record its status
+                        if last_post_status:
+                            feed_state[feed_id]['last_post'] = {
+                                "status": last_post_status,
+                                "timestamp": now.isoformat()
+                            }
+
+                        if newly_posted_ids:
+                            sent_articles.update(newly_posted_ids)
+                            save_sent_articles(sent_articles)
+                        
+                        state_changed = True
+                    except Exception as e:
+                        print(f"An unexpected error occurred while checking feed {feed_config.get('url')}: {e}")
+                    
+                    # Add a small delay between processing feeds to be gentler on resources
+                    time.sleep(2) 
             
-            time.sleep(60)
-        print("Scheduler stopped.")
-
-    def check_single_feed(self, feed_config, initial_check=False):
-        status_code = None
-        try:
-            feed_data = feedparser.parse(feed_config['url'])
-            status_code = feed_data.get('status', 500)
-            if feed_data.bozo:
-                print(f"Warning: Feed {feed_config['url']} may be malformed.")
-
-            now = datetime.now(timezone.utc)
-            time_cutoff = now - timedelta(hours=24)
-            
-            recent_entries = []
-            for entry in feed_data.entries:
-                published_time = None
-                if 'published_parsed' in entry and entry.published_parsed:
-                    published_time = datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
-                elif 'updated_parsed' in entry and entry.updated_parsed:
-                    published_time = datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
-
-                if published_time and published_time > time_cutoff:
-                    recent_entries.append(entry)
-
-            if initial_check:
-                if recent_entries:
-                    latest_entry = recent_entries[0]
-                    article_id = latest_entry.get('id', latest_entry.link)
-                    post_if_new(article_id, latest_entry, feed_data, feed_config['webhook_url'])
-
-                    all_recent_ids = {entry.get('id', entry.link) for entry in recent_entries}
-                    with file_lock:
-                        sent_articles_list = []
-                        try:
-                            with open(SENT_ARTICLES_FILE, 'r') as f:
-                                content = f.read()
-                                if content: sent_articles_list = yaml.safe_load(content) or []
-                        except FileNotFoundError: pass
-                        sent_articles_set = set(sent_articles_list)
-                        sent_articles_set.update(all_recent_ids)
-                        final_list = list(sent_articles_set)
-                        if len(final_list) > MAX_SENT_ARTICLES:
-                            final_list = final_list[-MAX_SENT_ARTICLES:]
-                        with open(SENT_ARTICLES_FILE, 'w') as f:
-                            yaml.dump(final_list, f)
-            else:
-                for entry in reversed(recent_entries):
-                    article_id = entry.get('id', entry.link)
-                    post_if_new(article_id, entry, feed_data, feed_config['webhook_url'])
-
-        except Exception as e:
-            print(f"Error processing feed {feed_config['url']}: {e}")
-            status_code = 500
-        finally:
-            with file_lock:
-                feed_state = load_feed_state()
-                feed_state[feed_config['id']] = {
-                    'last_checked': datetime.now(timezone.utc).isoformat(),
-                    'status_code': status_code
-                }
+            if state_changed:
                 save_feed_state(feed_state)
 
+            time.sleep(self.interval)
+
 if __name__ == "__main__":
-    initialize_files()
     scheduler = FeedScheduler()
-    try:
-        scheduler.run()
-    except KeyboardInterrupt:
-        scheduler.stop()
+    scheduler.run()
