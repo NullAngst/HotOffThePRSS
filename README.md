@@ -3,8 +3,6 @@ Backup your config before upgrading to V2! You can use the bash script to conver
 
 A basic bot to fetch RSS feeds and send them to a Discord channel via webhooks. No limit on feeds, channels, or servers. Easy to self host at home or on a remote server. Just a Simple Discord RSS Bot with intuitive Web UI. Links sent to Discord are Rich Embeds so they look nice.
 
-A lightweight, self-hostable Discord bot that fetches RSS Atom feeds and posts new entries to your server using webhooks. It comes with a simple, clean web interface for easy management. Requires an admin account stored locally with a salted and hashed password that is setup on first connect.
-
 <img src="https://github.com/ReverendRetro/SimpleDiscordRSS/blob/main/s1.png?raw=true">
 <img src="https://github.com/ReverendRetro/SimpleDiscordRSS/blob/main/s2.png?raw=true">
 
