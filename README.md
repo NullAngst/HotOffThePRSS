@@ -1,8 +1,8 @@
 # Hot Off The PRSS
 A pair of Python files to fetch RSS feeds and send them to a Discord channel via webhooks. No limit on feeds, channels, or servers. Easy to self host at home or on a remote server. Links sent to Discord are Rich Embeds so they look nice.
 
-<img src="https://github.com/ReverendRetro/SimpleDiscordRSS/blob/main/s1.png?raw=true">
-<img src="https://github.com/ReverendRetro/SimpleDiscordRSS/blob/main/s2.png?raw=true">
+<img src="https://raw.githubusercontent.com/NullAngst/HotOffThePRSS/refs/heads/main/dark.png?raw=true">
+<img src="https://raw.githubusercontent.com/NullAngst/HotOffThePRSS/refs/heads/main/light.png?raw=true">
 
 Comprehensive Web Interface
 - Complete Feed Management: A secure, password-protected web UI to add, edit, and delete feeds from any browser.
