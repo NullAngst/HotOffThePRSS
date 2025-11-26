@@ -1,10 +1,6 @@
 # scheduler.py
 # This script is a dedicated background process for fetching and posting RSS feeds.
 # It's designed to be run as a standalone service.
-#
-# NEW LOGIC (as of 2025-11-14):
-# - Implements per-webhook "sent" memory. sent_articles.yaml is now a dictionary
-#   where each key is a webhook URL, and its value is a list of sent article IDs.
 
 import os
 import json
@@ -240,6 +236,13 @@ class FeedScheduler:
             for feed_config in config.get("FEEDS", []):
                 feed_id = feed_config.get("id")
                 if not feed_id: continue
+                
+                # --- PAUSE CHECK ---
+                # If active is explicitly False, skip this feed
+                if not feed_config.get('active', True):
+                    # Optional: Log that we are skipping?
+                    # print(f"Skipping paused feed: {feed_config.get('name', feed_config.get('url'))}")
+                    continue
 
                 last_checked_str = feed_state.get(feed_id, {}).get('last_checked')
                 update_interval = feed_config.get("update_interval", 300)
