@@ -36,11 +36,11 @@ A pair of Python files to fetch RSS feeds and send them to a Discord channel via
 
 ### Intelligent & Reliable Fetching
 
-- Per-Webhook Memory: The bot tracks sent articles individually for each webhook. This ensures that if you add a new destination to an existing feed, the new channel will receive posts without causing duplicates in the old ones.
+- Per-Webhook Memory: The Script tracks sent articles individually for each webhook. This ensures that if you add a new destination to an existing feed, the new channel will receive posts without causing duplicates in the old ones.
 
-- 24-Hour Rolling Window: The bot only considers articles published within the last 24 hours, preventing accidental floods of old content.
+- 24-Hour Rolling Window: The Script only considers articles published within the last 24 hours, preventing accidental floods of old content.
 
-- Smart Initial Check: When a new feed is added, the bot silently seeds its memory with all recent articles. It will only post new content published after that moment, preventing an initial spam storm.
+- Smart Initial Check: When a new feed is added, the Script silently seeds its memory with all recent articles. It will only post new content published after that moment, preventing an initial spam storm.
 
 - Atomic State Management: Uses robust file locking and atomic write operations to prevent race conditions and duplicate posts, even under high load.
 
@@ -55,7 +55,7 @@ A pair of Python files to fetch RSS feeds and send them to a Discord channel via
 
 ### Stable & Efficient Architecture
 
-- Webhook-Based: Uses Discord webhooks for posting, eliminating the need for bot tokens and complex permissions.
+- Webhook-Based: Uses Discord webhooks for posting, eliminating the need for Script tokens and complex permissions.
 
 - Separated Services: The web UI and the background scheduler run as two separate, independent processes for maximum stability.
 
@@ -72,14 +72,14 @@ A pair of Python files to fetch RSS feeds and send them to a Discord channel via
 - pip and venv for managing Python packages.
 
 # Setup & Installation
-Follow these steps to get your RSS bot up and running on a Debian-based server.
+Follow these steps to get your RSS Script up and running on a Debian-based server.
 
 ## 1. Clone this repository to a directory on your server.
 ```
 git clone https://github.com/ReverendRetro/SimpleDiscordRSS.git
 ```
 
-Ensure you have the following files in your project directory (e.g., /home/your_user/discord-rss-bot): <br>
+Ensure you have the following files in your project directory (e.g., /home/your_user/discord-rss-Script): <br>
 main_web.py (The web interface) <br>
 scheduler.py (The background feed checker)
 
@@ -88,7 +88,7 @@ Create a virtual environment to keep the project's dependencies isolated.
 
 ### Navigate to your project directory
 ```
-cd /path/to/your/discord-rss-bot
+cd /path/to/your/discord-rss-Script
 ```
 
 ### Ensure needed deps are installed
@@ -137,8 +137,8 @@ You'll need a webhook URL for each channel you want to post to.
 - Give the webhook a name (e.g., "RSS Feeds") and copy the Webhook URL.
 
 
-## 5. Running the Bot as a Service (Recommended)
-To ensure the bot runs 24/7 and restarts automatically, we will set up two separate systemd services: one for the web UI and one for the scheduler.
+## 5. Running the Script as a Service (Recommended)
+To ensure the Script runs 24/7 and restarts automatically, we will set up two separate systemd services: one for the web UI and one for the scheduler.
 ## 1. Create the Web UI Service
 Create a service file for the Gunicorn web server.
 ```
@@ -149,15 +149,15 @@ sudo nano /etc/systemd/system/discord-rss-web.service
 Paste the following configuration. Remember to replace your_user with your actual Linux username and update the paths if necessary.
 ```
 [Unit]
-Description=Gunicorn instance to serve Discord RSS Bot Web UI
+Description=Gunicorn instance to serve Discord RSS Script Web UI
 After=network.target
 
 [Service]
 User=your_user
 Group=your_user
-WorkingDirectory=/home/your_user/discord-rss-bot
-Environment="PATH=/home/your_user/discord-rss-bot/venv/bin"
-ExecStart=/home/your_user/discord-rss-bot/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:5000 "main_web:app"
+WorkingDirectory=/home/your_user/discord-rss-Script
+Environment="PATH=/home/your_user/discord-rss-Script/venv/bin"
+ExecStart=/home/your_user/discord-rss-Script/venv/bin/gunicorn --workers 3 --bind 0.0.0.0:5000 "main_web:app"
 Restart=always
 
 [Install]
@@ -174,14 +174,14 @@ sudo nano /etc/systemd/system/discord-rss-scheduler.service
 Paste the following configuration, again replacing your_user and the paths.
 ```
 [Unit]
-Description=Scheduler for Discord RSS Bot
+Description=Scheduler for Discord RSS Script
 After=network.target
 
 [Service]
 User=your_user
 Group=your_user
-WorkingDirectory=/home/your_user/discord-rss-bot
-ExecStart=/home/your_user/discord-rss-bot/venv/bin/python scheduler.py
+WorkingDirectory=/home/your_user/discord-rss-Script
+ExecStart=/home/your_user/discord-rss-Script/venv/bin/python scheduler.py
 Restart=always
 
 [Install]
@@ -233,7 +233,7 @@ sudo journalctl -u discord-rss-web -n 50 --no-pager
 The scheduler log should show "Scheduler started." and "Scheduler running check..." messages.
 
 ## 8. Usage
-Once both services are running, you can manage the bot entirely through its web interface.
+Once Scripth services are running, you can manage the Script entirely through its web interface.
 
 ### 1. First-Time Setup & Login
 
@@ -277,7 +277,7 @@ The Webhook URL you copied from your Discord channel.
 
 An optional Label to describe the destination (e.g., "Tech Server - #alerts").
 
-Refresh Interval: How often (in seconds) the bot should check for new articles.
+Refresh Interval: How often (in seconds) the Script should check for new articles.
 
 Edit a Feed: Click the "Edit" link next to any feed to modify its settings, including adding or removing webhook destinations.
 
@@ -290,4 +290,4 @@ Download Backup: Click the button to save a complete config.json file of all you
 Restore from Backup: Upload a previously saved config.json file to instantly restore your configuration. This will overwrite your existing feeds.
 
 # Configuration Files
-The bot automatically creates and manages the configuration files in the directory it is created. No manual input required.
+The Script automatically creates and manages the configuration files in the directory it is created. No manual input required.
