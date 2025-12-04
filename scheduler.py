@@ -1,6 +1,10 @@
 # scheduler.py
 # This script is a dedicated background process for fetching and posting RSS feeds.
 # It's designed to be run as a standalone service.
+#
+# NEW LOGIC (as of 2025-11-14):
+# - Implements per-webhook "sent" memory. sent_articles.yaml is now a dictionary
+#   where each key is a webhook URL, and its value is a list of sent article IDs.
 
 import os
 import json
@@ -146,7 +150,9 @@ def check_single_feed(feed_config, feed_state):
     
     recent_articles = []
     for entry in feed_data.entries:
-        published_time = entry.get('published_parsed')
+        # Check for published date, fallback to updated date (for Atom/GitHub)
+        published_time = entry.get('published_parsed') or entry.get('updated_parsed')
+        
         if published_time:
             try:
                 published_dt = datetime.fromtimestamp(time.mktime(published_time)).replace(tzinfo=timezone.utc)
@@ -158,7 +164,7 @@ def check_single_feed(feed_config, feed_state):
     if not recent_articles:
         return status_code, last_post_status
 
-    recent_articles.sort(key=lambda x: x.get('published_parsed', (0,)*9), reverse=True)
+    recent_articles.sort(key=lambda x: x.get('published_parsed') or x.get('updated_parsed') or (0,)*9, reverse=True)
     
     # Map of all recent article IDs (link or GUID) to their entry data
     article_id_map = {
@@ -196,7 +202,7 @@ def check_single_feed(feed_config, feed_state):
             
             if articles_to_post:
                 # Sort them by date to post oldest-new first
-                articles_to_post.sort(key=lambda x: x.get('published_parsed', (0,)*9))
+                articles_to_post.sort(key=lambda x: x.get('published_parsed') or x.get('updated_parsed') or (0,)*9)
                 print(f"Found {len(articles_to_post)} new article(s) for {feed_url} -> {webhook.get('label', webhook_url)}")
                 
                 for entry in articles_to_post:
