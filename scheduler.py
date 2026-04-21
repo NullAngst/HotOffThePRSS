@@ -1,10 +1,6 @@
 # scheduler.py
 # This script is a dedicated background process for fetching and posting RSS feeds.
 # It's designed to be run as a standalone service.
-#
-# NEW LOGIC (as of 2025-11-14):
-# - Implements per-webhook "sent" memory. sent_articles.yaml is now a dictionary
-#   where each key is a webhook URL, and its value is a list of sent article IDs.
 
 import os
 import json
@@ -25,7 +21,7 @@ SENT_ARTICLES_FILE = os.path.join(SCRIPT_DIR, "sent_articles.yaml")
 FEED_STATE_FILE = os.path.join(SCRIPT_DIR, "feed_state.json")
 
 # --- Set a common User-Agent for all requests ---
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0"
 feedparser.USER_AGENT = USER_AGENT
 
 # --- Data Loading and Saving Functions ---
