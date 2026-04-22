@@ -79,7 +79,9 @@ Docker is the easiest way to run Hot Off The PRSS. Both the web UI and scheduler
 ### 1. Build and start the container
 
 ```bash
-docker compose up -d --build
+cd path/to/your/docker/setup
+docker build -t your-image-name .
+docker run -p your-port:your-port your-image-name
 ```
 
 The web UI will be available at `http://<your-server-ip>:5000`.
