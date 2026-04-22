@@ -1,0 +1,10 @@
+services:
+  hotofftheprss:
+    build: .
+    image: hotofftheprss:latest
+    container_name: hotofftheprss
+    ports:
+      - 5000:5000
+    restart: unless-stopped
+    volumes:
+      - /data/compose/hotofftheprss:/usr/src/app
