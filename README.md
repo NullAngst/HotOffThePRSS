@@ -68,66 +68,32 @@ git clone https://github.com/NullAngst/HotOffThePRSS.git
 cd HotOffThePRSS
 ```
 
-Then follow either the **Docker** or **Manual** path below.
+Then follow either the **Docker**, **Portainer**, or **Manual** path below.
 
 ---
 
-## Running with Portainer (Recommended)
-
-Deploying through Portainer requires one manual step first. The `docker-compose.yml` maps a host directory over the entire `/usr/src/app` working directory. If Portainer creates this volume from scratch, it will be empty, and it will overwrite the container's code, causing an immediate crash.
-
-To avoid this, you must populate the host directory before deploying:
-
-1. **Prepare the Host Directory**
-   SSH into your host machine and clone the repository into the exact path specified in your volume mount.
-   ```bash
-   sudo mkdir -p /data/compose
-   cd /data/compose
-   git clone https://github.com/NullAngst/HotOffThePRSS.git hotofftheprss```
-
-  Create the Stack in Portainer
-
-  Open Portainer and go to Stacks.
-
-  Click Add stack and name it hotofftheprss.
-
-  Deploy via Git Repository
-
-  Select Repository as the build method.
-
-  Repository URL: `https://github.com/NullAngst/HotOffThePRSS.git`
-  
-  Repository reference: `refs/heads/main`
-
-  Compose path: `docker-compose.yml`
-  
-  Click Deploy the stack.
-
-  Portainer will pull the code, build the Docker image, and mount the directory you created in Step 1. Your configurations, state files, and user databases will persist safely in that host directory.
-
-## Running with Docker 
+## Running with Docker
 
 Docker is the easiest way to run Hot Off The PRSS. Both the web UI and scheduler start automatically inside a single container, and your data lives on the host so nothing is lost when you update.
+
+The `Dockerfile`, `docker-compose.yml`, `docker_entrypoint.sh`, and `requirements.txt` all live in the `Docker/` subdirectory of the repository.
 
 ### 1. Build and start the container
 
 ```bash
-cd path/to/your/docker/setup
-docker build -t your-image-name .
-docker run -p your-port:your-port your-image-name
+cd Docker
+docker compose up -d --build
 ```
 
 The web UI will be available at `http://<your-server-ip>:5000`.
 
 ### 2. Data persistence
 
-Your `config.json` and `users.json` are stored in the host directory mapped by the volume. By default this is:
+By default, `docker-compose.yml` maps the host path `/data/compose/hotofftheprss` to `/usr/src/app` inside the container. All application files — including `config.json` and `user.json` — are read from and written to that host directory.
 
-```
-/data/compose/hotofftheprss/
-```
+> **Important:** Because the volume mount covers the entire working directory, it will hide the container's built-in code if the host path is empty. See the [Portainer section](#running-with-portainer) below for how to handle this correctly. When using plain Docker Compose on a machine where you cloned the repo, the files are already present and this is not an issue.
 
-Back this directory up to keep your feeds and accounts safe.
+Back up `/data/compose/hotofftheprss/` to keep your feeds and accounts safe.
 
 ### 3. View logs
 
@@ -139,11 +105,59 @@ docker logs hotofftheprss --follow
 ### 4. Update to a new version
 
 ```bash
+cd Docker
 docker compose down
+git pull
 docker compose up -d --build
 ```
 
 Your data directory is untouched by rebuilds.
+
+---
+
+## Running with Portainer
+
+Portainer pulls and builds the image without pre-populating the host volume, which means the volume mount will hide the container's code and cause an immediate crash on first boot. You must populate the host directory manually before deploying.
+
+### Step 1 — Prepare the host directory
+
+SSH into the host machine and clone the repository into the path the volume expects:
+
+```bash
+sudo mkdir -p /data/compose
+cd /data/compose
+git clone https://github.com/NullAngst/HotOffThePRSS.git hotofftheprss
+```
+
+This places all application files (including `main_web.py`, `scheduler.py`, and `docker_entrypoint.sh`) at `/data/compose/hotofftheprss/`, which is exactly where the volume mount points.
+
+### Step 2 — Create the stack in Portainer
+
+1. Open Portainer and navigate to **Stacks**.
+2. Click **Add stack** and give it a name (e.g. `hotofftheprss`).
+3. Under **Build method**, select **Repository**.
+4. Fill in the repository details:
+   - **Repository URL:** `https://github.com/NullAngst/HotOffThePRSS.git`
+   - **Repository reference:** `refs/heads/main`
+   - **Compose path:** `Docker/docker-compose.yml`
+5. Click **Deploy the stack**.
+
+Portainer will build the image and start the container. Because you pre-populated the host directory in Step 1, the volume mount finds the code it needs rather than an empty folder.
+
+### Step 3 — Verify it's running
+
+In Portainer, open the `hotofftheprss` container's logs. You should see Gunicorn start up and begin accepting connections. Then navigate to `http://<your-server-ip>:5000`.
+
+### Updating via Portainer
+
+Pull the latest code on the host first, then redeploy:
+
+```bash
+cd /data/compose/hotofftheprss
+git pull
+```
+
+Then go to your stack in Portainer and click **Update the stack** (with **Re-pull image** enabled if you want a fresh image build).
 
 ---
 
@@ -279,7 +293,7 @@ Hit **Force Check** on any feed to trigger an immediate check outside the normal
 Navigate to **Backup / Restore** in the dashboard.
 
 - **Config backup** — downloads `config.json` with all your feeds and webhook destinations
-- **User DB backup** *(Owner only)* — downloads the encrypted `users.json` to migrate accounts between installs
+- **User DB backup** *(Owner only)* — downloads `user.json` to migrate accounts between installs
 - **Restore** — upload either file to overwrite the current state; the scheduler picks up changes automatically
 
 ---
@@ -321,4 +335,4 @@ All config files are created and managed automatically in the project directory.
 | File | Purpose |
 |---|---|
 | `config.json` | Feed list, webhook destinations, intervals, sent-article memory |
-| `users.json` | Hashed user credentials and roles |
+| `user.json` | Hashed user credentials and roles |
