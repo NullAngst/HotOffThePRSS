@@ -5,10 +5,18 @@ import json
 import uuid
 import yaml
 import sys
+import tempfile
 import importlib.util
 from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template_string, request, redirect, url_for, flash, get_flashed_messages, send_file, session, g
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# Minimum acceptable length for any user-set password. Intentionally low to
+# not break small self-hosted deployments, but high enough to catch empty
+# or single-character passwords.
+MIN_PASSWORD_LEN = 8
+MAX_PASSWORD_LEN = 256  # avoid resource-exhaustion via massive hashes
+MAX_USERNAME_LEN = 64
 
 # --- Get the absolute path of the script's directory ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,7 +34,7 @@ SCHEDULER_FILE = os.path.join(SCRIPT_DIR, "scheduler.py") # Path to scheduler sc
 
 # --- Set a common User-Agent for all feedparser requests ---
 import feedparser
-feedparser.USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/116.0"
+feedparser.USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0"
 
 # --- Helper function for human-readable time ---
 def time_ago(dt_str):
@@ -72,19 +80,6 @@ def get_freshness_class(dt_str):
 
 # Make the helper functions available in templates
 app.jinja_env.globals.update(time_ago=time_ago, get_freshness_class=get_freshness_class)
-
-# --- Helper to Import Scheduler Logic ---
-def get_scheduler_check_function():
-    """Dynamically imports the check_single_feed function from scheduler.py"""
-    try:
-        spec = importlib.util.spec_from_file_location("scheduler", SCHEDULER_FILE)
-        scheduler_module = importlib.util.module_from_spec(spec)
-        sys.modules["scheduler"] = scheduler_module
-        spec.loader.exec_module(scheduler_module)
-        return scheduler_module.check_single_feed, scheduler_module.load_feed_state, scheduler_module.save_feed_state
-    except Exception as e:
-        print(f"Error importing scheduler: {e}")
-        return None, None, None
 
 # --- HTML Templates ---
 
@@ -1408,54 +1403,127 @@ TEMPLATES = {
 
 # --- Configuration and State Management ---
 
+def _atomic_write(path, writer, mode='w'):
+    """Write to `path` atomically via a temp file + os.replace().
+    Prevents a partial write from corrupting config or user data on a crash.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=directory)
+    try:
+        with os.fdopen(fd, mode) as f:
+            writer(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def save_config(config_data):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
+    _atomic_write(CONFIG_FILE, lambda f: json.dump(config_data, f, indent=4))
+
 
 def initialize_files():
     """Ensure all necessary files exist before the app starts."""
     if not os.path.exists(CONFIG_FILE):
         save_config({"FEEDS": []})
     if not os.path.exists(SENT_ARTICLES_FILE):
-        with open(SENT_ARTICLES_FILE, 'w') as f: yaml.dump([], f)
+        _atomic_write(SENT_ARTICLES_FILE, lambda f: yaml.dump({}, f))
     if not os.path.exists(FEED_STATE_FILE):
-        with open(FEED_STATE_FILE, 'w') as f: json.dump({}, f)
+        _atomic_write(FEED_STATE_FILE, lambda f: json.dump({}, f))
     # User file is checked separately by the auth logic
 
+
 def load_config():
-    with open(CONFIG_FILE, 'r') as f:
-        return json.load(f)
+    """Load feed config. Returns a safe empty default if the file is missing
+    or corrupted, rather than raising 500s on every request."""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "FEEDS" not in data:
+            return {"FEEDS": []}
+        if not isinstance(data["FEEDS"], list):
+            data["FEEDS"] = []
+        return data
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Warning: load_config failed ({e}); returning empty config.")
+        return {"FEEDS": []}
+
 
 def load_feed_state():
     try:
         with open(FEED_STATE_FILE, 'r') as f:
             content = f.read()
-            if not content: return {}
+            if not content:
+                return {}
             return json.loads(content)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
 
 # --- Initialize files on application startup ---
 initialize_files()
 
 # --- Authentication Logic ---
 
+
+def _validate_password(pw):
+    """Return (ok, error_message). Checks length bounds only; callers are
+    responsible for policy around who may set a password for whom.
+    """
+    if pw is None:
+        return False, "Password is required."
+    if len(pw) < MIN_PASSWORD_LEN:
+        return False, f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if len(pw) > MAX_PASSWORD_LEN:
+        return False, f"Password must be at most {MAX_PASSWORD_LEN} characters."
+    return True, None
+
+
+def _validate_username(name):
+    if not name:
+        return False, "Username is required."
+    name = name.strip()
+    if not name:
+        return False, "Username cannot be blank."
+    if len(name) > MAX_USERNAME_LEN:
+        return False, f"Username must be at most {MAX_USERNAME_LEN} characters."
+    return True, None
+
+
 def get_secret_key():
     """Generates a secret key and saves it, or loads the existing one."""
     if not os.path.exists(SECRET_KEY_FILE):
         print("Generating new secret key...")
-        key = os.urandom(24)
-        with open(SECRET_KEY_FILE, 'wb') as f:
-            f.write(key)
+        key = os.urandom(32)  # 256 bits
+        # Atomic write so a crash mid-key-write doesn't leave an empty file
+        # that would silently reset sessions on next boot.
+        _atomic_write(SECRET_KEY_FILE, lambda f: f.write(key), mode='wb')
+        try:
+            os.chmod(SECRET_KEY_FILE, 0o600)
+        except OSError:
+            pass
         return key
-    else:
-        with open(SECRET_KEY_FILE, 'rb') as f:
-            return f.read()
+    with open(SECRET_KEY_FILE, 'rb') as f:
+        return f.read()
+
 
 app.secret_key = get_secret_key()
 
+
 def admin_user_exists():
-    return os.path.exists(USER_FILE)
+    """An admin exists only if user.json is present AND contains at least one
+    valid user. A zero-byte user.json used to let anyone claim the Owner slot
+    via /setup because os.path.exists() was the sole check.
+    """
+    if not os.path.exists(USER_FILE):
+        return False
+    return len(get_users()) > 0
+
 
 def get_users():
     """Safely loads all users from the JSON file."""
@@ -1467,18 +1535,23 @@ def get_users():
             if not content:
                 return []
             data = json.loads(content)
-            # Migrate single user object to list if necessary
-            if isinstance(data, dict):
-                data = [data]
-                with open(USER_FILE, 'w') as f:
-                     json.dump(data, f)
-            return data
+        # Migrate single user object to list if necessary
+        if isinstance(data, dict):
+            data = [data]
+            save_users(data)
+        if not isinstance(data, list):
+            return []
+        return data
     except (json.JSONDecodeError, FileNotFoundError):
         return []
 
+
 def save_users(users):
-    with open(USER_FILE, 'w') as f:
-        json.dump(users, f)
+    _atomic_write(USER_FILE, lambda f: json.dump(users, f, indent=2))
+    try:
+        os.chmod(USER_FILE, 0o600)
+    except OSError:
+        pass
 
 def get_user_by_id(user_id):
     users = get_users()
@@ -1506,17 +1579,32 @@ def setup():
         return redirect(url_for('login'))
 
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+
+        ok, err = _validate_username(username)
+        if not ok:
+            flash(err, 'error')
+            full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["setup"])
+            return render_template_string(full_html)
+
+        ok, err = _validate_password(password)
+        if not ok:
+            flash(err, 'error')
+            full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["setup"])
+            return render_template_string(full_html)
+
+        # Double-check at write time: another request could race setup.
+        if admin_user_exists():
+            return redirect(url_for('login'))
 
         user_data = [{
             "id": str(uuid.uuid4()),
             "username": username,
             "password": generate_password_hash(password),
-            "role": "owner" # First user is always owner
+            "role": "owner"  # First user is always owner
         }]
-        with open(USER_FILE, 'w') as f:
-            json.dump(user_data, f)
+        save_users(user_data)
 
         flash('Admin account created successfully! Please log in.', 'success')
         return redirect(url_for('login'))
@@ -1530,10 +1618,10 @@ def login():
         return redirect(url_for('view_feeds'))
 
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
         users = get_users()
-        user = next((u for u in users if u['username'] == username), None)
+        user = next((u for u in users if u.get('username') == username), None)
 
         if user and check_password_hash(user.get('password', ''), password):
             session.clear()
@@ -1558,30 +1646,72 @@ def view_feeds():
     full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["view_feeds"])
     return render_template_string(full_html, config=config, feed_state=feed_state)
 
+def _parse_feed_form(form):
+    """Parse and validate a feed create/edit form.
+    Returns (feed_fields_dict, error_message_or_None)."""
+    name = (form.get('name') or '').strip()
+    url = (form.get('url') or '').strip()
+
+    if not name:
+        return None, "Feed name is required."
+    if not url:
+        return None, "Feed URL is required."
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return None, "Feed URL must start with http:// or https://"
+
+    try:
+        update_interval = int(form.get('update_interval') or 0)
+    except (TypeError, ValueError):
+        return None, "Refresh interval must be a whole number of seconds."
+    # Floor at 30s: Discord and most feed hosts don't appreciate tighter polling.
+    if update_interval < 30:
+        return None, "Refresh interval must be at least 30 seconds."
+    if update_interval > 86400 * 30:
+        return None, "Refresh interval is unreasonably large."
+
+    webhook_urls = form.getlist('webhook_url')
+    webhook_labels = form.getlist('webhook_label')
+    # Pad labels list to match URLs so zip doesn't silently drop entries.
+    if len(webhook_labels) < len(webhook_urls):
+        webhook_labels = list(webhook_labels) + [''] * (len(webhook_urls) - len(webhook_labels))
+
+    webhooks_data = []
+    for u, label in zip(webhook_urls, webhook_labels):
+        u = (u or '').strip()
+        if not u:
+            continue
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return None, f"Webhook URL must start with http:// or https:// (got: {u[:40]})"
+        webhooks_data.append({"url": u, "label": (label or '').strip()})
+
+    if not webhooks_data:
+        return None, "At least one webhook URL is required."
+
+    active_status = form.get('active') == 'true'
+
+    return {
+        "name": name,
+        "url": url,
+        "webhooks": webhooks_data,
+        "update_interval": update_interval,
+        "active": active_status,
+    }, None
+
+
 @app.route('/add', methods=['GET', 'POST'])
 def add_feed():
     if request.method == 'POST':
+        fields, err = _parse_feed_form(request.form)
+        if err:
+            flash(err, 'error')
+            full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["add_feed"])
+            return render_template_string(full_html, FORM_TEMPLATE_SHARED_SCRIPT=TEMPLATES["form_shared_script"])
+
         config = load_config()
-        webhook_urls = request.form.getlist('webhook_url')
-        webhook_labels = request.form.getlist('webhook_label')
-        active_status = request.form.get('active') == 'true'
-
-        webhooks_data = [
-            {"url": url, "label": label}
-            for url, label in zip(webhook_urls, webhook_labels) if url
-        ]
-
-        new_feed = {
-            "id": str(uuid.uuid4()),
-            "name": request.form['name'],
-            "url": request.form['url'],
-            "webhooks": webhooks_data,
-            "update_interval": int(request.form['update_interval']),
-            "active": active_status
-        }
+        new_feed = {"id": str(uuid.uuid4()), **fields}
         config['FEEDS'].append(new_feed)
         save_config(config)
-        flash(f'Feed "{new_feed["url"]}" added successfully!', 'success')
+        flash(f'Feed "{new_feed["name"]}" added successfully!', 'success')
         return redirect(url_for('view_feeds'))
 
     full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["add_feed"])
@@ -1601,29 +1731,22 @@ def edit_feed(feed_id):
         feed_to_edit['webhooks'] = [{"url": url, "label": ""} for url in feed_to_edit['webhook_urls']]
 
     if request.method == 'POST':
-        webhook_urls = request.form.getlist('webhook_url')
-        webhook_labels = request.form.getlist('webhook_label')
-        active_status = request.form.get('active') == 'true'
-
-        webhooks_data = [
-            {"url": url, "label": label}
-            for url, label in zip(webhook_urls, webhook_labels) if url
-        ]
+        fields, err = _parse_feed_form(request.form)
+        if err:
+            flash(err, 'error')
+            full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["edit_feed"])
+            return render_template_string(full_html, feed=feed_to_edit, FORM_TEMPLATE_SHARED_SCRIPT=TEMPLATES["form_shared_script"])
 
         for i, feed in enumerate(config['FEEDS']):
             if feed['id'] == feed_id:
-                config['FEEDS'][i]['name'] = request.form['name']
-                config['FEEDS'][i]['url'] = request.form['url']
-                config['FEEDS'][i]['webhooks'] = webhooks_data
-                config['FEEDS'][i]['update_interval'] = int(request.form['update_interval'])
-                config['FEEDS'][i]['active'] = active_status
+                config['FEEDS'][i].update(fields)
                 # Clean up legacy fields if they exist
                 config['FEEDS'][i].pop('webhook_url', None)
                 config['FEEDS'][i].pop('webhook_urls', None)
                 break
 
         save_config(config)
-        flash(f'Feed updated successfully!', 'success')
+        flash('Feed updated successfully!', 'success')
         return redirect(url_for('view_feeds'))
 
     full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["edit_feed"])
@@ -1636,10 +1759,61 @@ def delete_feed(feed_id):
     if feed_to_delete:
         config['FEEDS'] = [feed for feed in config['FEEDS'] if feed['id'] != feed_id]
         save_config(config)
-        flash(f'Feed "{feed_to_delete["url"]}" deleted.', 'success')
+
+        # Best-effort cleanup of state tied to this feed. Webhook memory
+        # cleanup is defensive-only: other feeds may share the URL, so we
+        # only drop memory for webhook URLs that are truly orphaned.
+        try:
+            spec = importlib.util.spec_from_file_location("scheduler", SCHEDULER_FILE)
+            scheduler_module = importlib.util.module_from_spec(spec)
+            sys.modules.setdefault("scheduler", scheduler_module)
+            spec.loader.exec_module(scheduler_module)
+            # prune_feed_state is already exclusive-locked in the scheduler.
+            remaining_ids = [f.get("id") for f in config.get("FEEDS", []) if f.get("id")]
+            scheduler_module.prune_feed_state(remaining_ids)
+        except Exception as e:
+            print(f"Warning: could not prune feed_state after delete: {e}")
+
+        try:
+            _prune_orphaned_webhook_memory(config)
+        except Exception as e:
+            print(f"Warning: could not prune sent-article memory after delete: {e}")
+
+        flash(f'Feed "{feed_to_delete.get("name") or feed_to_delete.get("url")}" deleted.', 'success')
     else:
         flash('Feed not found.', 'error')
     return redirect(url_for('view_feeds'))
+
+
+def _prune_orphaned_webhook_memory(config):
+    """Drop entries in sent_articles.yaml for webhook URLs that no longer
+    appear in any feed. Called opportunistically after deletes/edits.
+    """
+    active = set()
+    for feed in config.get('FEEDS', []) or []:
+        for wh in feed.get('webhooks') or []:
+            if wh.get('url'):
+                active.add(wh['url'])
+
+    if not os.path.exists(SENT_ARTICLES_FILE):
+        return
+
+    try:
+        with open(SENT_ARTICLES_FILE, 'r') as f:
+            memory = yaml.safe_load(f) or {}
+    except Exception:
+        return
+
+    if not isinstance(memory, dict):
+        return
+
+    stale = [url for url in memory if url not in active]
+    if not stale:
+        return
+    for url in stale:
+        del memory[url]
+
+    _atomic_write(SENT_ARTICLES_FILE, lambda f: yaml.dump(memory, f))
 
 @app.route('/toggle_pause/<feed_id>', methods=['POST'])
 def toggle_pause_feed(feed_id):
@@ -1666,37 +1840,39 @@ def force_check_feed(feed_id):
         flash('Feed not found.', 'error')
         return redirect(url_for('view_feeds'))
 
-    # 2. Import scheduler logic
-    check_single_feed, load_feed_state_func, save_feed_state_func = get_scheduler_check_function()
-
-    if not check_single_feed:
-        flash('Error: Could not load scheduler module.', 'error')
+    # 2. Import scheduler logic. We use scheduler.update_feed_state rather than
+    # a read/modify/save_feed_state cycle because the scheduler process may be
+    # writing to the same file; update_feed_state holds an exclusive file lock
+    # across read-modify-write so concurrent updates cannot clobber each other.
+    try:
+        spec = importlib.util.spec_from_file_location("scheduler", SCHEDULER_FILE)
+        scheduler_module = importlib.util.module_from_spec(spec)
+        sys.modules["scheduler"] = scheduler_module
+        spec.loader.exec_module(scheduler_module)
+    except Exception as e:
+        flash(f'Error loading scheduler module: {e}', 'error')
         return redirect(url_for('view_feeds'))
 
     # 3. Run the check immediately
     try:
-        # We need to load the current state to pass it in (required by the new scheduler logic)
-        current_state = load_feed_state_func()
+        # Pass a read-only snapshot of current state in: check_single_feed only
+        # uses it to decide whether a feed is "new" (never-seen).
+        current_state = scheduler_module.load_feed_state()
+        status_code, last_post_status = scheduler_module.check_single_feed(feed_config, current_state)
 
-        # Run the check
-        status_code, last_post_status = check_single_feed(feed_config, current_state)
-
-        # 4. Update the state file with the result so the UI updates immediately
+        # 4. Atomically merge our results into feed_state.json so the scheduler
+        # process doesn't overwrite them (and vice versa).
         now = datetime.now(timezone.utc)
-
-        if feed_id not in current_state:
-            current_state[feed_id] = {}
-
-        current_state[feed_id]['status_code'] = status_code
-        current_state[feed_id]['last_checked'] = now.isoformat()
-
+        updates = {
+            'status_code': status_code,
+            'last_checked': now.isoformat(),
+        }
         if last_post_status:
-            current_state[feed_id]['last_post'] = {
+            updates['last_post'] = {
                 "status": last_post_status,
-                "timestamp": now.isoformat()
+                "timestamp": now.isoformat(),
             }
-
-        save_feed_state_func(current_state)
+        scheduler_module.update_feed_state(feed_id, updates)
 
         flash(f'Feed checked successfully. Status: {status_code}', 'success')
 
@@ -1713,16 +1889,25 @@ def settings():
 
 @app.route('/settings/change-password', methods=['POST'])
 def change_password():
-    current_password = request.form['current_password']
-    new_password = request.form['new_password']
+    current_password = request.form.get('current_password') or ''
+    new_password = request.form.get('new_password') or ''
+
+    ok, err = _validate_password(new_password)
+    if not ok:
+        flash(f"New password rejected: {err}", "error")
+        return redirect(url_for('settings'))
+
+    if new_password == current_password:
+        flash("New password must be different from the current one.", "error")
+        return redirect(url_for('settings'))
 
     users = get_users()
     # Since g.user is a copy, we need to find the user in the list to modify it
     user_index = next((i for i, u in enumerate(users) if u['id'] == g.user['id']), -1)
 
     if user_index == -1:
-         flash("User not found.", "error")
-         return redirect(url_for('settings'))
+        flash("User not found.", "error")
+        return redirect(url_for('settings'))
 
     user = users[user_index]
 
@@ -1743,11 +1928,24 @@ def add_user():
         return redirect(url_for('settings'))
 
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        role = request.form.get('role', 'admin') # Default to admin
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        role = request.form.get('role', 'admin')  # Default to admin
 
-        # Only owner can create super admins
+        ok, err = _validate_username(username)
+        if not ok:
+            flash(err, "error")
+            return redirect(url_for('add_user'))
+
+        ok, err = _validate_password(password)
+        if not ok:
+            flash(err, "error")
+            return redirect(url_for('add_user'))
+
+        # Clamp role to known values and enforce who can create what.
+        if role not in ('admin', 'super_admin'):
+            role = 'admin'
+        # 'owner' is never creatable via this route.
         if role == 'super_admin' and g.user['role'] != 'owner':
             role = 'admin'
 
@@ -1780,10 +1978,17 @@ def promote_user(user_id):
     users = get_users()
     target_user = next((u for u in users if u['id'] == user_id), None)
 
-    if target_user and target_user['role'] == 'admin':
+    if not target_user:
+        flash("User not found.", "error")
+        return redirect(url_for('settings'))
+    if target_user.get('role') == 'owner':
+        flash("The Owner's role cannot be changed.", "error")
+        return redirect(url_for('settings'))
+
+    if target_user['role'] == 'admin':
         target_user['role'] = 'super_admin'
         save_users(users)
-        flash(f"User promoted to Super Admin.", "success")
+        flash("User promoted to Super Admin.", "success")
 
     return redirect(url_for('settings'))
 
@@ -1796,15 +2001,26 @@ def demote_user(user_id):
     users = get_users()
     target_user = next((u for u in users if u['id'] == user_id), None)
 
-    if target_user and target_user['role'] == 'super_admin':
+    if not target_user:
+        flash("User not found.", "error")
+        return redirect(url_for('settings'))
+    if target_user.get('role') == 'owner':
+        flash("The Owner's role cannot be changed.", "error")
+        return redirect(url_for('settings'))
+
+    if target_user['role'] == 'super_admin':
         target_user['role'] = 'admin'
         save_users(users)
-        flash(f"User demoted to Admin.", "success")
+        flash("User demoted to Admin.", "success")
 
     return redirect(url_for('settings'))
 
-@app.route('/settings/users/reset-password/<user_id>', methods=['GET', 'POST'])
+@app.route('/settings/users/reset-password/<user_id>', methods=['GET'])
 def reset_password_page(user_id):
+    """Renders the reset-password form. The form itself POSTs to
+    force_reset_password, so this route only needs to handle GET. The prior
+    implementation declared methods=['GET','POST'] but had no POST handler,
+    so a POST would fall through and return None -> 500."""
     if g.user['role'] not in ['owner', 'super_admin']:
         flash("You do not have permission to reset passwords.", "error")
         return redirect(url_for('settings'))
@@ -1816,14 +2032,18 @@ def reset_password_page(user_id):
         flash("User not found.", "error")
         return redirect(url_for('settings'))
 
+    # Owner's password can only be reset via the Owner's own change-password flow.
+    if target_user.get('role') == 'owner' and target_user['id'] != g.user['id']:
+        flash("The Owner's password can only be changed by the Owner themselves.", "error")
+        return redirect(url_for('settings'))
+
     # Super Admin check: Can only reset admins
     if g.user['role'] == 'super_admin' and target_user.get('role') != 'admin':
         flash("Super Admins can only reset passwords for Admins.", "error")
         return redirect(url_for('settings'))
 
-    if request.method == 'GET':
-        full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["reset_password"])
-        return render_template_string(full_html, target_user=target_user)
+    full_html = TEMPLATES["layout"].replace('{% block content %}{% endblock %}', TEMPLATES["reset_password"])
+    return render_template_string(full_html, target_user=target_user)
 
 @app.route('/settings/users/force-reset-password/<user_id>', methods=['POST'])
 def force_reset_password(user_id):
@@ -1831,25 +2051,34 @@ def force_reset_password(user_id):
         flash("You do not have permission to reset passwords.", "error")
         return redirect(url_for('settings'))
 
-    new_password = request.form['new_password']
+    new_password = request.form.get('new_password') or ''
+    ok, err = _validate_password(new_password)
+    if not ok:
+        flash(err, "error")
+        return redirect(url_for('reset_password_page', user_id=user_id))
 
     users = get_users()
     user_index = next((i for i, u in enumerate(users) if u['id'] == user_id), -1)
 
-    if user_index != -1:
-        target_user = users[user_index]
-
-        # Super Admin check: Can only reset admins
-        if g.user['role'] == 'super_admin' and target_user.get('role') != 'admin':
-            flash("Super Admins can only reset passwords for Admins.", "error")
-            return redirect(url_for('settings'))
-
-        users[user_index]['password'] = generate_password_hash(new_password)
-        save_users(users)
-        flash("Password forcefully updated.", "success")
-    else:
+    if user_index == -1:
         flash("User not found.", "error")
+        return redirect(url_for('settings'))
 
+    target_user = users[user_index]
+
+    # Owner's password cannot be force-reset by anyone but themselves.
+    if target_user.get('role') == 'owner' and target_user['id'] != g.user['id']:
+        flash("The Owner's password can only be changed by the Owner themselves.", "error")
+        return redirect(url_for('settings'))
+
+    # Super Admin check: Can only reset admins
+    if g.user['role'] == 'super_admin' and target_user.get('role') != 'admin':
+        flash("Super Admins can only reset passwords for Admins.", "error")
+        return redirect(url_for('settings'))
+
+    users[user_index]['password'] = generate_password_hash(new_password)
+    save_users(users)
+    flash("Password forcefully updated.", "success")
     return redirect(url_for('settings'))
 
 @app.route('/settings/users/delete/<user_id>', methods=['POST'])
@@ -1926,21 +2155,44 @@ def upload_backup():
         flash('No file selected for uploading.', 'error')
         return redirect(url_for('backup_restore'))
 
-    if file and file.filename.endswith('.json'):
-        try:
-            content = file.read().decode('utf-8')
-            # Basic validation
-            data = json.loads(content)
-            if 'FEEDS' not in data:
-                raise ValueError("Invalid config file: 'FEEDS' key is missing.")
-
-            with open(CONFIG_FILE, 'w') as f:
-                f.write(content)
-            flash('Configuration restored successfully! Please restart the scheduler service for changes to take full effect.', 'success')
-        except Exception as e:
-            flash(f'Error processing file: {e}', 'error')
-    else:
+    if not file.filename.endswith('.json'):
         flash('Invalid file type. Please upload a .json file.', 'error')
+        return redirect(url_for('backup_restore'))
+
+    try:
+        content = file.read().decode('utf-8')
+        data = json.loads(content)
+        if not isinstance(data, dict) or 'FEEDS' not in data:
+            raise ValueError("Invalid config file: 'FEEDS' key is missing.")
+        if not isinstance(data['FEEDS'], list):
+            raise ValueError("Invalid config file: 'FEEDS' must be a list.")
+
+        # Shallow per-feed validation. We're permissive here (people have old
+        # backups in circulation) but we want to refuse obvious garbage that
+        # would blow up the scheduler on the next cycle.
+        for idx, feed in enumerate(data['FEEDS']):
+            if not isinstance(feed, dict):
+                raise ValueError(f"Feed at index {idx} is not an object.")
+            if not feed.get('id'):
+                feed['id'] = str(uuid.uuid4())
+            if not feed.get('url'):
+                raise ValueError(f"Feed at index {idx} is missing 'url'.")
+            # Normalize legacy shapes so the scheduler picks them up correctly.
+            if 'webhook_urls' in feed and 'webhooks' not in feed:
+                feed['webhooks'] = [{"url": u, "label": ""} for u in feed['webhook_urls']]
+                feed.pop('webhook_urls', None)
+            if 'webhook_url' in feed and 'webhooks' not in feed:
+                feed['webhooks'] = [{"url": feed['webhook_url'], "label": feed.get('name', '')}]
+                feed.pop('webhook_url', None)
+            if 'webhooks' in feed and not isinstance(feed['webhooks'], list):
+                raise ValueError(f"Feed at index {idx}: 'webhooks' must be a list.")
+
+        # save_config uses atomic write; this also means a mid-write crash
+        # won't leave you with a truncated config.json.
+        save_config(data)
+        flash('Configuration restored successfully! Please restart the scheduler service for changes to take full effect.', 'success')
+    except Exception as e:
+        flash(f'Error processing file: {e}', 'error')
 
     return redirect(url_for('backup_restore'))
 
@@ -1960,42 +2212,60 @@ def upload_users_backup():
         flash('No file selected for uploading.', 'error')
         return redirect(url_for('backup_restore'))
 
-    if file and file.filename.endswith('.json'):
-        try:
-            content = file.read().decode('utf-8')
-            users_data = json.loads(content)
-
-            # Validate structure: must be a list of user objects
-            if not isinstance(users_data, list):
-                # Handle single object case from very old versions
-                if isinstance(users_data, dict) and 'username' in users_data:
-                    users_data = [users_data]
-                else:
-                    raise ValueError("Invalid user file format. Expected a list of users.")
-
-            # Validate required fields
-            for u in users_data:
-                if not all(k in u for k in ('username', 'password', 'id')):
-                    raise ValueError(f"User entry missing required fields: {u.get('username', 'unknown')}")
-                # Ensure role exists
-                if 'role' not in u:
-                    u['role'] = 'admin'
-
-            # Ensure at least one owner exists in the backup
-            if not any(u.get('role') == 'owner' for u in users_data):
-                # Safety check: promote the first user to owner if none exist
-                users_data[0]['role'] = 'owner'
-
-            # Save file
-            with open(USER_FILE, 'w') as f:
-                json.dump(users_data, f, indent=4)
-
-            flash('User database restored successfully. You may need to log in again.', 'success')
-
-        except Exception as e:
-            flash(f'Error restoring users: {e}', 'error')
-    else:
+    if not file.filename.endswith('.json'):
         flash('Invalid file type. Please upload a .json file.', 'error')
+        return redirect(url_for('backup_restore'))
+
+    try:
+        content = file.read().decode('utf-8')
+        users_data = json.loads(content)
+
+        # Normalize: accept a single-user legacy object as a 1-element list.
+        if isinstance(users_data, dict) and 'username' in users_data:
+            users_data = [users_data]
+        if not isinstance(users_data, list):
+            raise ValueError("Invalid user file format. Expected a list of users.")
+        if not users_data:
+            raise ValueError("User backup is empty.")
+
+        seen_ids = set()
+        seen_usernames = set()
+        for u in users_data:
+            if not isinstance(u, dict):
+                raise ValueError("User entry is not an object.")
+            for k in ('username', 'password', 'id'):
+                if k not in u or not u[k]:
+                    raise ValueError(f"User entry missing required field '{k}'.")
+            if u['id'] in seen_ids:
+                raise ValueError(f"Duplicate user id in backup: {u['id']}")
+            if u['username'] in seen_usernames:
+                raise ValueError(f"Duplicate username in backup: {u['username']}")
+            seen_ids.add(u['id'])
+            seen_usernames.add(u['username'])
+
+            # Clamp role to known values.
+            role = u.get('role')
+            if role not in ('owner', 'super_admin', 'admin'):
+                u['role'] = 'admin'
+
+        # Ensure at least one owner exists; if the uploader excluded all owners,
+        # refuse rather than silently promoting a random account.
+        if not any(u.get('role') == 'owner' for u in users_data):
+            raise ValueError("Backup contains no 'owner' user; refusing to lock everyone out.")
+
+        save_users(users_data)
+
+        # The current session's user_id may no longer exist (or have a different
+        # role) after restore. Clear the session so the UI prompts for login
+        # with the restored credentials rather than silently acting as a
+        # now-nonexistent user.
+        session.clear()
+
+        flash('User database restored successfully. Please log in again with the restored credentials.', 'success')
+        return redirect(url_for('login'))
+
+    except Exception as e:
+        flash(f'Error restoring users: {e}', 'error')
 
     return redirect(url_for('backup_restore'))
 
@@ -2007,4 +2277,12 @@ if __name__ == "__main__":
     print("\nThis script is for the web UI and is not meant to be run directly for production.")
     print("Use Gunicorn to serve the 'app' object in this file.")
     print("Example: gunicorn --bind 0.0.0.0:5000 main_web:app")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+    # Dev convenience only. The Werkzeug debugger is a remote-code-execution
+    # vector when exposed on a public interface, so default to loopback when
+    # debug mode is on and make opting in to external access explicit via
+    # the PRSS_DEV_UNSAFE=1 env var.
+    dev_debug = os.environ.get("PRSS_DEV_DEBUG") == "1"
+    unsafe_bind_all = os.environ.get("PRSS_DEV_UNSAFE") == "1"
+    host = "0.0.0.0" if unsafe_bind_all else "127.0.0.1"
+    app.run(host=host, port=5000, debug=dev_debug)
