@@ -33,53 +33,98 @@ Hot Off The PRSS watches any number of RSS feeds and posts new articles to Disco
 
 ## How It Works
 
-Two processes run independently:
+Two processes run side by side:
 
 - **`main_web.py`** — A Flask/Gunicorn web server that serves the dashboard and handles all configuration.
 - **`scheduler.py`** — A background process that wakes up on each feed's configured interval, checks for new articles, and fires webhooks.
 
 They communicate via the shared `config.json` file. You never need to edit that file by hand.
 
+When running under Docker, both processes are launched inside a single container by `docker_entrypoint.sh` — the scheduler runs in the background and Gunicorn runs in the foreground. Data is persisted via a mounted volume so your feeds and accounts survive container restarts and rebuilds.
+
 ---
 
 ## Requirements
 
+**Without Docker:**
 - Python 3.8+
 - `pip` and `venv`
 - A Linux, macOS, or Windows host (Linux recommended for production)
+
+**With Docker:**
+- Docker and Docker Compose
+
+**Either way:**
 - One or more Discord webhook URLs
 
 ---
 
 ## Installation
 
-### 1. Clone the repository
+### Clone the repository
 
 ```bash
 git clone https://github.com/NullAngst/HotOffThePRSS.git
 cd HotOffThePRSS
 ```
 
-### 2. Create and activate a virtual environment
+Then follow either the **Docker** or **Manual** path below.
+
+---
+
+## Running with Docker (recommended)
+
+Docker is the easiest way to run Hot Off The PRSS. Both the web UI and scheduler start automatically inside a single container, and your data lives on the host so nothing is lost when you update.
+
+### 1. Build and start the container
+
+```bash
+docker compose up -d --build
+```
+
+The web UI will be available at `http://<your-server-ip>:5000`.
+
+### 2. Data persistence
+
+Your `config.json` and `users.json` are stored in the host directory mapped by the volume. By default this is:
+
+```
+/data/compose/hotofftheprss/
+```
+
+Back this directory up to keep your feeds and accounts safe.
+
+### 3. View logs
+
+```bash
+docker logs hotofftheprss
+docker logs hotofftheprss --follow
+```
+
+### 4. Update to a new version
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+Your data directory is untouched by rebuilds.
+
+---
+
+## Running Manually
+
+### 1. Set up a Python environment
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 pip install feedparser PyYAML Flask gunicorn requests werkzeug
 ```
 
-### 4. Get a Discord webhook URL
+### 2. Get a Discord webhook URL
 
 In Discord: **Channel Settings → Integrations → Webhooks → Create Webhook**. Copy the URL. Repeat for each channel you want to post to.
-
----
-
-## Running
 
 ### Development / quick test
 
