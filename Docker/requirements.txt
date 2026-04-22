@@ -1,0 +1,6 @@
+feedparser
+PyYAML
+Flask
+gunicorn
+requests
+werkzeug
