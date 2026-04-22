@@ -72,7 +72,40 @@ Then follow either the **Docker** or **Manual** path below.
 
 ---
 
-## Running with Docker (recommended)
+## Running with Portainer (Recommended)
+
+Deploying through Portainer requires one manual step first. The `docker-compose.yml` maps a host directory over the entire `/usr/src/app` working directory. If Portainer creates this volume from scratch, it will be empty, and it will overwrite the container's code, causing an immediate crash.
+
+To avoid this, you must populate the host directory before deploying:
+
+1. **Prepare the Host Directory**
+   SSH into your host machine and clone the repository into the exact path specified in your volume mount.
+   ```bash
+   sudo mkdir -p /data/compose
+   cd /data/compose
+   git clone https://github.com/NullAngst/HotOffThePRSS.git hotofftheprss```
+
+  Create the Stack in Portainer
+
+  Open Portainer and go to Stacks.
+
+  Click Add stack and name it hotofftheprss.
+
+  Deploy via Git Repository
+
+  Select Repository as the build method.
+
+  Repository URL: `https://github.com/NullAngst/HotOffThePRSS.git`
+  
+  Repository reference: `refs/heads/main`
+
+  Compose path: `docker-compose.yml`
+  
+  Click Deploy the stack.
+
+  Portainer will pull the code, build the Docker image, and mount the directory you created in Step 1. Your configurations, state files, and user databases will persist safely in that host directory.
+
+## Running with Docker 
 
 Docker is the easiest way to run Hot Off The PRSS. Both the web UI and scheduler start automatically inside a single container, and your data lives on the host so nothing is lost when you update.
 
