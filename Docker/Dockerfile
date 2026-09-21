@@ -1,27 +1,26 @@
 FROM python:3.13-slim
 
-# Set the working directory in the container
-WORKDIR /usr/src/app
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PRSS_DATA_DIR=/data
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+WORKDIR /app
 
-# Install python dependencies
+COPY Docker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entrypoint script
-# Note: If you mount a volume to /usr/src/app, this file in the image
-# will be hidden by the file on your host.
-COPY docker_entrypoint.sh .
-
-# Ensure execution permissions
+# The application code now lives in the image. Only data is on the volume,
+# so rebuilding the image is all an update needs.
+COPY main_web.py scheduler.py prss_core.py ./
+COPY templates ./templates
+COPY static ./static
+COPY Docker/docker_entrypoint.sh ./docker_entrypoint.sh
 RUN chmod +x docker_entrypoint.sh
 
-# Make port 5000 available to the world outside this container
+VOLUME /data
 EXPOSE 5000
 
-# Define environment variable for unbuffered logging (helps see logs instantly)
-ENV PYTHONUNBUFFERED=1
+HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
+  CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=4).status == 200 else 1)"
 
-# Run the entrypoint script
 ENTRYPOINT ["./docker_entrypoint.sh"]
