@@ -8,7 +8,7 @@
     <div class="board-head">
       <div class="board-title">
         <h1 id="feeds-title">Feeds</h1>
-        <a class="btn btn-primary" href="{{ url_for('add_feed') }}">Add feed</a>
+        {% if feeds %}<a class="btn" href="{{ url_for('bulk_edit') }}">Edit all</a>{% endif %}
       </div>
       {% if feeds %}
       <div class="board-tools">
@@ -82,7 +82,7 @@
           </div>
           <div class="c-dest">
             {% if f.hooks %}
-              <span class="dest-count">{{ f.hooks|length }} channel{{ '' if f.hooks|length == 1 else 's' }}</span>
+              <span class="dest-count">{{ f.hooks|length }} destination{{ '' if f.hooks|length == 1 else 's' }}</span>
               <span class="dest-names">{{ f.hooks|map(attribute='label')|select|join(', ') or 'Unlabeled' }}</span>
             {% else %}<span class="muted">No destinations</span>{% endif %}
           </div>
@@ -118,6 +118,7 @@
             <div class="detail-block">
               <h3>Feed address</h3>
               <p class="mono selectable">{{ f.url }}</p>
+              {% if f.cookies %}<p class="muted"><span class="tag">cookies</span> Fetched with saved cookies.</p>{% endif %}
               {% if f.redirected_to %}
               <div class="callout callout-warn">
                 <p>This feed now answers from a different address. Updating it avoids an extra request on every check and keeps working if the old address stops redirecting.</p>
@@ -137,9 +138,9 @@
               <h3>Destinations</h3>
               {% if f.hooks %}
               <ul class="dest-list">
-                {% for h in f.hooks %}<li><span>{{ h.label or 'Unlabeled' }}</span><code>{{ h.masked }}</code></li>{% endfor %}
+                {% for h in f.hooks %}<li><span><span class="tag">{{ h.type }}</span>{{ h.label or 'Unlabeled' }}</span><code>{{ h.masked }}</code></li>{% endfor %}
               </ul>
-              {% else %}<p class="muted">This feed has nowhere to post. Edit it to add a Discord webhook.</p>{% endif %}
+              {% else %}<p class="muted">This feed has nowhere to post. Edit it to add a destination.</p>{% endif %}
             </div>
           </div>
           <div class="detail-foot">
@@ -159,7 +160,7 @@
     {% else %}
     <div class="empty">
       <h2>No feeds yet</h2>
-      <p>Add an RSS or Atom feed and pick the Discord channels it should post to. Articles already in the feed are skipped; only new ones are posted.</p>
+      <p>Add an RSS or Atom feed and choose where it should post: Discord, Slack, Matrix, Telegram and more. Articles already in the feed are skipped; only new ones are posted.</p>
       <a class="btn btn-primary" href="{{ url_for('add_feed') }}">Add your first feed</a>
     </div>
     {% endif %}
