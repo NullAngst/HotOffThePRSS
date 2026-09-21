@@ -1,10 +1,21 @@
 services:
   hotofftheprss:
-    build: .
+    build:
+      context: ..
+      dockerfile: Docker/Dockerfile
     image: hotofftheprss:latest
     container_name: hotofftheprss
     ports:
       - 5000:5000
     restart: unless-stopped
+    environment:
+      - PRSS_DATA_DIR=/data
+      # Set to 1 when serving over HTTPS so the session cookie is marked Secure.
+      - PRSS_SECURE_COOKIES=0
+      # Set to 1 only when running behind your own reverse proxy.
+      - PRSS_TRUST_PROXY=0
     volumes:
-      - /data/compose/hotofftheprss:/usr/src/app
+      # Same host folder as before. It used to be mounted over the code
+      # directory; it now only holds data (config.json, user.json, secret.key,
+      # prss_state.db). Existing files in it are picked up and migrated.
+      - /data/compose/hotofftheprss:/data
