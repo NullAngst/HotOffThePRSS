@@ -9,16 +9,33 @@
     del: function (k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
   };
 
+  // `transport: true` marks failures where the request never got a real answer
+  // from the app, as opposed to the app replying with an error.
   function post(url, body) {
     return fetch(url, {
       method: "POST",
       credentials: "same-origin",
+      redirect: "manual",
       headers: { "Content-Type": "application/json", "X-Requested-With": "fetch", "X-CSRF-Token": csrf },
       body: JSON.stringify(body || {})
     }).then(function (r) {
-      return r.json().catch(function () { return { ok: false, error: "Unexpected response (" + r.status + ")" }; });
-    }, function () { return { ok: false, error: "Could not reach the server." }; });
+      // The app never redirects these requests. A redirect comes from a layer in
+      // front of it, typically an authentication proxy whose sign-in expired.
+      if (r.type === "opaqueredirect" || (r.status >= 300 && r.status < 400)) {
+        return { ok: false, transport: true, error: "The request was redirected before it reached Hot Off The PRSS. " +
+          "An authentication layer in front of the app (Cloudflare Access, Authelia, Authentik) probably needs you to sign in again. Reload the page." };
+      }
+      // The app answers with JSON, including its own errors. Anything else came
+      // from something in front of it.
+      return r.json().catch(function () {
+        return { ok: false, transport: true, error: "The request was blocked before it reached Hot Off The PRSS (HTTP " + r.status +
+          "). A reverse proxy, firewall or security filter in front of the app is the likely cause." };
+      });
+    }, function () {
+      return { ok: false, transport: true, error: "Could not reach the server. Check your connection and reload the page." };
+    });
   }
+
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -199,6 +216,9 @@
       post(form.action).then(function (res) {
         btn.classList.remove("is-busy");
         btn.disabled = false;
+        // If the background request could not get through, fall back to a
+        // normal form post: the browser handles redirects and sign-in pages.
+        if (res.transport) { form.submit(); return; }
         if (!res.ok) { setStatus(feed, "error", res.error || "Could not queue the check"); return; }
         if (res.warning) setStatus(feed, "queued", "Queued; scheduler not running");
         schedulePoll(1500);
@@ -544,14 +564,101 @@
   var form = document.getElementById("feed-form");
   if (form) initFeedForm(form);
 
+  var bulkForm = document.getElementById("bulk-form");
+  if (bulkForm) initBulkEdit(bulkForm);
+
+  // --- Edit all ---------------------------------------------------------------------
+  function initBulkEdit(form) {
+    var items = Array.prototype.slice.call(form.querySelectorAll("#bulk-list li"));
+    var boxes = function () { return items.map(function (li) { return li.querySelector("input"); }); };
+    var count = document.getElementById("bulk-count");
+    var submit = document.getElementById("bulk-submit");
+    var search = document.getElementById("bulk-search");
+    var toggle = document.getElementById("bulk-change-interval");
+    var intervalRow = document.getElementById("bulk-interval");
+    var chips = Array.prototype.slice.call(form.querySelectorAll(".js-pick-interval"));
+
+    function update() {
+      var n = boxes().filter(function (b) { return b.checked; }).length;
+      count.textContent = n + " of " + items.length + " selected";
+      submit.textContent = n ? "Apply to " + n + " feed" + (n === 1 ? "" : "s") : "Apply";
+      submit.disabled = n === 0;
+      chips.forEach(function (c) {
+        var group = items.filter(function (li) { return li.dataset.seconds === c.dataset.seconds; });
+        var all = group.length && group.every(function (li) { return li.querySelector("input").checked; });
+        c.setAttribute("aria-pressed", all ? "true" : "false");
+      });
+    }
+    function syncInterval() {
+      intervalRow.querySelectorAll("input, select").forEach(function (i) { i.disabled = !toggle.checked; });
+    }
+    form.addEventListener("change", function (e) {
+      if (e.target === toggle) syncInterval();
+      update();
+    });
+    chips.forEach(function (c) {
+      c.addEventListener("click", function (e) {
+        items.forEach(function (li) {
+          var input = li.querySelector("input");
+          if (li.dataset.seconds === c.dataset.seconds) input.checked = true;
+          else if (!e.shiftKey) input.checked = false;
+        });
+        update();
+      });
+    });
+    function visible() { return items.filter(function (li) { return !li.hidden; }); }
+    document.getElementById("bulk-all").addEventListener("click", function () {
+      visible().forEach(function (li) { li.querySelector("input").checked = true; });
+      update();
+    });
+    document.getElementById("bulk-none").addEventListener("click", function () {
+      visible().forEach(function (li) { li.querySelector("input").checked = false; });
+      update();
+    });
+    search.addEventListener("input", function () {
+      var q = search.value.trim().toLowerCase();
+      items.forEach(function (li) { li.hidden = !!q && li.dataset.text.indexOf(q) === -1; });
+    });
+    syncInterval();
+    update();
+  }
+
   function initFeedForm(form) {
     var hooks = document.getElementById("hooks");
     var tpl = document.getElementById("hook-template");
+    var types = {};
+    try { types = JSON.parse(form.dataset.destTypes || "{}"); } catch (e) { types = {}; }
+
+    // Show the fields the chosen service needs, with its own labels and help.
+    function applyType(row) {
+      var sel = row.querySelector(".js-dest-type");
+      var meta = types[sel.value];
+      if (!meta) return;
+      row.dataset.type = sel.value;
+      row.querySelectorAll(".hook-f").forEach(function (lab) {
+        var spec = meta.fields[lab.dataset.field];
+        lab.hidden = !spec;
+        if (spec) {
+          lab.querySelector(".js-flabel").textContent = spec[0];
+          lab.querySelector("input").placeholder = spec[1];
+        }
+      });
+      var help = row.querySelector(".js-dest-help");
+      if (help) help.textContent = meta.help || "";
+    }
+    hooks.addEventListener("change", function (e) {
+      if (e.target.classList.contains("js-dest-type")) {
+        var row = e.target.closest(".hook-row");
+        applyType(row);
+        var res = row.querySelector(".hook-result");
+        if (res) { res.textContent = ""; res.className = "hook-result"; }
+      }
+    });
 
     document.getElementById("add-hook").addEventListener("click", function () {
       var node = tpl.content.firstElementChild.cloneNode(true);
       hooks.appendChild(node);
-      node.querySelector('input[name="webhook_label"]').focus();
+      node.querySelector('select[name="dest_type"]').focus();
     });
 
     hooks.addEventListener("click", function (e) {
@@ -562,6 +669,7 @@
           row.remove();
         } else {
           row.querySelectorAll("input").forEach(function (i) { i.value = ""; });
+          applyType(row);
           row.querySelector(".hook-result").textContent = "";
         }
         return;
@@ -569,12 +677,12 @@
       var testBtn = e.target.closest(".js-test-hook");
       if (testBtn) {
         var out = row.querySelector(".hook-result");
-        var url = row.querySelector('input[name="webhook_url"]').value.trim();
-        var label = row.querySelector('input[name="webhook_label"]').value.trim();
+        var val = function (n) { var i = row.querySelector('[name="dest_' + n + '"]'); return i ? i.value.trim() : ""; };
+        var payload = { type: val("type"), label: val("label"), url: val("url"), target: val("target"), token: val("token") };
         out.className = "hook-result";
         out.textContent = "Sending a test message...";
         testBtn.disabled = true;
-        post(form.dataset.testUrl, { url: url, label: label }).then(function (res) {
+        post(form.dataset.testUrl, payload).then(function (res) {
           testBtn.disabled = false;
           out.className = "hook-result " + (res.ok ? "ok" : "bad");
           out.textContent = res.ok ? "Test message sent. Check the channel." : (res.error || "The test failed.");
@@ -592,7 +700,10 @@
       preview.className = "preview";
       preview.textContent = "Loading the feed...";
       previewBtn.disabled = true;
-      post(form.dataset.previewUrl, { url: url }).then(function (res) {
+      var ck = document.getElementById("feed-cookies"), ua = document.getElementById("feed-ua");
+      post(form.dataset.previewUrl, {
+        url: url, cookies: ck ? ck.value : "", user_agent: ua ? ua.value : ""
+      }).then(function (res) {
         previewBtn.disabled = false;
         preview.textContent = "";
         if (!res.ok) {
