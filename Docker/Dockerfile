@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # The application code now lives in the image. Only data is on the volume,
 # so rebuilding the image is all an update needs.
-COPY main_web.py scheduler.py prss_core.py ./
+COPY main_web.py scheduler.py prss_core.py destinations.py ./
 COPY templates ./templates
 COPY static ./static
 COPY Docker/docker_entrypoint.sh ./docker_entrypoint.sh
