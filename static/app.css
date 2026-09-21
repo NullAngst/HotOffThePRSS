@@ -337,6 +337,34 @@ fieldset.panel { min-width: 0; }
 .select-inline { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: .88rem; }
 .select-inline select { width: auto; min-height: 34px; }
 
+/* Auto-refresh control */
+.refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding-right: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+  min-height: 34px;
+}
+.refresh .icon-btn { height: 32px; width: 32px; }
+.refresh .i-pause { display: none; }
+.refresh .icon-btn[aria-pressed="true"] .i-play { display: none; }
+.refresh .icon-btn[aria-pressed="true"] .i-pause { display: block; }
+.refresh select {
+  width: auto;
+  min-height: 30px;
+  padding: 3px 6px;
+  border: 0;
+  background-color: transparent;
+  font-size: .88rem;
+}
+.refresh-count { min-width: 3.4em; text-align: right; color: var(--accent); font-size: .82rem; }
+.refresh-count[data-waiting="true"] { color: var(--ink-3); }
+.refresh-custom { display: inline-flex; align-items: center; gap: 4px; color: var(--ink-3); font-size: .84rem; }
+.refresh-custom input { width: 78px; min-height: 28px; padding: 3px 8px; }
+
 .feed-list {
   background: var(--surface);
   border: 1px solid var(--line);
