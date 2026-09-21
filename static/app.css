@@ -307,8 +307,11 @@ fieldset.panel { min-width: 0; }
 .board { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 28px; align-items: start; }
 .board-head { margin-bottom: 14px; }
 .board-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
-.board-tools { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; }
-.filters { display: flex; flex-wrap: wrap; gap: 6px; }
+/* Filters always sit on their own line, with search and tools underneath, so
+   the layout does not shift with window width or display scaling. */
+.board-tools { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+.filters { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; scrollbar-width: thin; padding-bottom: 2px; }
+.filters .chip { flex: none; white-space: nowrap; }
 .chip {
   display: inline-flex;
   align-items: center;
@@ -331,7 +334,7 @@ fieldset.panel { min-width: 0; }
 .chip-attn[data-zero="true"] b { color: var(--ink-3); }
 .chip-attn[aria-pressed="true"] b { color: var(--surface); }
 .tool-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.search { position: relative; display: block; width: 260px; }
+.search { position: relative; display: block; flex: 1 1 240px; max-width: 360px; }
 .search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; fill: none; stroke: var(--ink-3); stroke-width: 2; stroke-linecap: round; }
 .search input { padding-left: 32px; min-height: 34px; }
 .select-inline { display: flex; align-items: center; gap: 8px; color: var(--ink-3); font-size: .88rem; }
@@ -506,7 +509,7 @@ fieldset.panel { min-width: 0; }
 
 .hook-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(0, 2.2fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
   align-items: end;
   padding: 12px 0;
@@ -599,3 +602,50 @@ fieldset.panel { min-width: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Destination type tag and cookie marker */
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--ink-3);
+  font-size: .74rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+  vertical-align: 1px;
+}
+.dest-list .tag { margin-right: 6px; }
+
+/* Destination rows: service and label on the first line, then the service's
+   own fields. The address spans the row; target and token share a line. */
+.hook-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px 12px; align-items: end; }
+.hook-fields .hook-url { grid-column: 1 / -1; }
+.hook-help { grid-column: 1 / -1; margin: 0; font-size: .84rem; }
+@media (max-width: 640px) {
+  .hook-fields { grid-template-columns: 1fr; }
+}
+
+/* Access (cookies) section on the feed form */
+.access { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.access summary { cursor: pointer; font-weight: 600; color: var(--ink-2); }
+.access summary:focus-visible { outline: none; box-shadow: var(--focus); border-radius: 4px; }
+.access[open] summary { margin-bottom: 10px; }
+.access textarea { width: 100%; resize: vertical; font-size: .85rem; }
+
+/* Edit all */
+.bulk-groups { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
+.bulk-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--r-ctl); max-height: 460px; overflow-y: auto; background: var(--surface); }
+.bulk-list li { border-top: 1px solid var(--line); }
+.bulk-list li:first-child { border-top: 0; }
+.bulk-list label { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
+.bulk-list label:hover { background: var(--surface-2); }
+.bulk-list .b-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bulk-list .b-name small { color: var(--ink-3); margin-left: 8px; }
+.bulk-list .b-meta { color: var(--ink-3); font-size: .85rem; white-space: nowrap; }
+.bulk-list li[hidden] { display: none; }
+.bulk-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.bulk-bar .search { max-width: 300px; }
+.bulk-count { color: var(--ink-2); font-size: .9rem; }
+.radio-row { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.radio-row label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
