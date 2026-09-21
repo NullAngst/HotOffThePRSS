@@ -1,6 +1,6 @@
-feedparser
-PyYAML
-Flask
-gunicorn
-requests
-werkzeug
+feedparser>=6.0
+PyYAML>=6.0
+Flask>=3.0
+gunicorn>=22.0
+requests>=2.31
+werkzeug>=3.0
