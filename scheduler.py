@@ -1,6 +1,7 @@
 # scheduler.py
 # Background process: checks feeds on their interval and posts new articles
-# to Discord webhooks. Run it next to the web UI (Docker does this for you).
+# to their destinations (Discord, Slack, Matrix, ...). Run it next to the web
+# UI (Docker does this for you).
 
 import os
 import re
@@ -10,12 +11,13 @@ import signal
 import calendar
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests
 import feedparser
 
 import prss_core as core
+import destinations as dest
 
 USER_AGENT = os.environ.get(
     "PRSS_USER_AGENT",
@@ -32,10 +34,9 @@ MAX_POSTS_PER_CHECK = max(1, int(os.environ.get("PRSS_MAX_POSTS_PER_CHECK", "20"
 PRUNE_EVERY = 600
 POST_DELAY = 0.4
 
-DISCORD_TITLE_MAX = 256
-DISCORD_FOOTER_MAX = 2048
+TITLE_MAX = 256
+FEED_NAME_MAX = 200
 SUMMARY_LEN = 350
-EMBED_COLOR = 0x58B9FF
 
 _TAG_RE = re.compile(r"<[^>]*>")
 _WS_RE = re.compile(r"\s+")
@@ -56,7 +57,26 @@ def _hook_lock(key):
 
 # --- Fetching -------------------------------------------------------------------
 
-def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
+def cookie_jar(url, cookie_text):
+    """Cookies scoped to the feed's own host. requests only sends jar cookies
+    to a matching domain, so a redirect to another site never receives them."""
+    pairs = core.parse_cookies(cookie_text)
+    if not pairs:
+        return None
+    host = urlparse(url).hostname or ""
+    jar = requests.cookies.RequestsCookieJar()
+    for name, value in pairs:
+        jar.set(name, value, domain=host, path="/")
+    return jar
+
+
+def _looks_like_login(body, final_url):
+    head = body[:200000].decode("utf-8", "ignore").lower()
+    return ('type="password"' in head or "type='password'" in head
+            or "/login" in (final_url or "").lower())
+
+
+def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT, cookies=None, user_agent=None):
     """Download and parse a feed. Returns a dict describing the result.
 
     requests follows redirects itself, so the final status is almost never
@@ -64,7 +84,7 @@ def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
     the "redirected" badge was always meant to show.
     """
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": user_agent or USER_AGENT,
         "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.5",
     }
     if etag:
@@ -75,7 +95,8 @@ def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
            "not_modified": False, "parsed": None, "etag": None, "modified": None}
     deadline = time.monotonic() + timeout
     try:
-        with requests.get(url, headers=headers, timeout=(10, timeout), stream=True) as resp:
+        with requests.get(url, headers=headers, timeout=(10, timeout), stream=True,
+                          cookies=cookie_jar(url, cookies)) as resp:
             out["status"] = resp.status_code
             if resp.history and resp.url.rstrip("/") != url.rstrip("/"):
                 out["redirected_to"] = resp.url
@@ -85,6 +106,9 @@ def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
                 return out
             if not (200 <= resp.status_code < 300):
                 out["error"] = f"HTTP {resp.status_code}"
+                if resp.status_code in (401, 403):
+                    out["error"] += ("; the site refused access, so the cookies may have expired" if cookies
+                                     else "; if this feed needs a login, add cookies under Access")
                 return out
             chunks, size = [], 0
             for chunk in resp.iter_content(65536):
@@ -100,6 +124,7 @@ def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
             out["etag"] = resp.headers.get("ETag")
             out["modified"] = resp.headers.get("Last-Modified")
             ctype = resp.headers.get("Content-Type", "")
+            final_url = resp.url
     except requests.Timeout:
         out["error"] = f"Timed out after {timeout}s"
         return out
@@ -117,7 +142,12 @@ def fetch_feed(url, etag=None, modified=None, timeout=FEED_TIMEOUT):
     # feedparser happily "parses" an HTML page into an empty feed. An empty
     # version string means it did not recognize RSS, Atom or RDF at all.
     if not parsed.entries and not parsed.get("version"):
-        out["error"] = "Not an RSS or Atom feed (the address returned a web page or other content)"
+        if _looks_like_login(body, final_url):
+            out["error"] = ("The site returned a login page instead of the feed. "
+                            + ("The cookies may have expired or been signed out." if cookies
+                               else "It probably needs cookies from a signed-in browser (see the feed's Access settings)."))
+        else:
+            out["error"] = "Not an RSS or Atom feed (the address returned a web page or other content)"
         return out
     out["parsed"] = parsed
     return out
@@ -177,74 +207,20 @@ def _entry_image(entry):
     return None
 
 
-def build_embed(feed, entry, published):
-    embed = {
-        "title": clean_text(entry.get("title"), DISCORD_TITLE_MAX) or "Untitled article",
-        "color": EMBED_COLOR,
-        "footer": {"text": clean_text(feed["name"], DISCORD_FOOTER_MAX) or "RSS"},
-    }
+def build_article(feed, entry, published):
+    """Platform-neutral article; destinations.py formats it per service."""
     link = entry.get("link")
-    if _valid_http(link):
-        embed["url"] = link  # Discord rejects the whole embed on an invalid url
-    summary = clean_text(entry.get("summary") or entry.get("description"), SUMMARY_LEN)
-    if summary:
-        embed["description"] = summary
-    if published:
-        embed["timestamp"] = datetime.fromtimestamp(published, tz=timezone.utc).isoformat()
-    image = _entry_image(entry)
-    if image:
-        embed["thumbnail"] = {"url": image}
-    return embed
+    return {
+        "title": clean_text(entry.get("title"), TITLE_MAX) or "Untitled article",
+        "link": link if _valid_http(link) else None,
+        "summary": clean_text(entry.get("summary") or entry.get("description"), SUMMARY_LEN),
+        "published": published,
+        "image": _entry_image(entry),
+        "feed_name": clean_text(feed["name"], FEED_NAME_MAX) or "RSS",
+    }
 
 
 # --- Posting --------------------------------------------------------------------
-
-def send_webhook(url, payload):
-    """POST to a Discord webhook. Returns (ok, message, permanent).
-
-    `permanent` means retrying this exact payload will never succeed (Discord
-    rejected its content), so the article is marked as handled. Everything
-    else stays unmarked and is retried on the next check.
-    """
-    payload = {"allowed_mentions": {"parse": []}, **payload}
-    for _ in range(4):
-        try:
-            r = requests.post(url, json=payload, timeout=15,
-                              headers={"User-Agent": "HotOffThePRSS (self-hosted RSS relay)"})
-        except requests.Timeout:
-            return False, "Discord did not respond in time", False
-        except requests.RequestException:
-            return False, "Could not reach Discord", False
-        if r.status_code in (200, 204):
-            if r.headers.get("X-RateLimit-Remaining") == "0":
-                try:
-                    time.sleep(min(float(r.headers.get("X-RateLimit-Reset-After", "1")), 10))
-                except ValueError:
-                    time.sleep(1)
-            return True, "Sent", False
-        if r.status_code == 429:
-            wait = 2.0
-            try:
-                wait = float(r.json().get("retry_after", wait))
-            except Exception:
-                try:
-                    wait = float(r.headers.get("Retry-After", wait))
-                except (TypeError, ValueError):
-                    pass
-            time.sleep(min(max(wait, 0.5), 30))
-            continue
-        if r.status_code in (401, 403, 404):
-            return False, f"Webhook rejected ({r.status_code}); it may have been deleted in Discord", False
-        if 400 <= r.status_code < 500:
-            detail = ""
-            try:
-                detail = str(r.json().get("message", ""))[:120]
-            except Exception:
-                pass
-            return False, f"Discord refused the post ({r.status_code}) {detail}".strip(), True
-        return False, f"Discord server error ({r.status_code})", False
-    return False, "Still rate limited by Discord after retries", False
-
 
 def _mark_sent(conn, key, ids, now):
     conn.executemany(
@@ -268,8 +244,8 @@ def _known_ids(conn, key, ids):
 
 def _deliver_to_hook(feed, hook, recent, all_ids, seeded):
     """Handle one destination. Returns (posted, failure_message, seeded_now)."""
-    key = core.webhook_key(hook["url"])
-    label = hook["label"] or "Unlabeled destination"
+    key = core.dest_key(hook)
+    label = hook["label"] or dest.TYPES[hook["type"]]["name"]
     now = time.time()
     with _hook_lock(key), core.db() as conn:
         if key not in seeded:
@@ -299,13 +275,13 @@ def _deliver_to_hook(feed, hook, recent, all_ids, seeded):
 
         posted = 0
         for aid, entry, published in fresh:
-            embed = build_embed(feed, entry, published)
-            ok, msg, permanent = send_webhook(hook["url"], {"embeds": [embed]})
-            # Record only after Discord accepted it (or can never accept it).
+            article = build_article(feed, entry, published)
+            ok, msg, permanent = dest.send(hook, article)
+            # Record only after the service accepted it (or can never accept it).
             # The old code recorded first, so any failed post was lost for good.
             if ok or permanent:
                 _mark_sent(conn, key, [aid], time.time())
-            core.log_delivery(conn, feed, label, embed["title"], embed.get("url"), msg, ok)
+            core.log_delivery(conn, feed, label, article["title"], article["link"], msg, ok)
             if ok:
                 posted += 1
             elif not permanent:
@@ -323,13 +299,14 @@ def check_feed(feed):
         seeded = {r[0] for r in conn.execute("SELECT webhook FROM seeded WHERE feed_id = ?", (fid,))}
     st = dict(row) if row else {}
 
-    hook_keys = [core.webhook_key(h["url"]) for h in feed["webhooks"]]
+    hook_keys = [core.dest_key(h) for h in feed["webhooks"]]
     # No conditional GET while a destination still needs seeding; a 304 would
     # postpone seeding until the next real change and then swallow it.
     conditional = bool(hook_keys) and all(k in seeded for k in hook_keys)
     res = fetch_feed(feed["url"],
                      st.get("etag") if conditional else None,
-                     st.get("modified") if conditional else None)
+                     st.get("modified") if conditional else None,
+                     cookies=feed.get("cookies"), user_agent=feed.get("user_agent"))
 
     state = {"last_checked": time.time(), "checking_since": None, "status_code": res["status"],
              "redirected_to": res["redirected_to"], "redirect_code": res["redirect_code"]}
@@ -373,7 +350,7 @@ def check_feed(feed):
         total += posted
         seeded_any = seeded_any or seeded_now
         if fail:
-            failures.append(f"{hook['label'] or 'Destination'}: {fail}")
+            failures.append(f"{hook['label'] or dest.TYPES[hook['type']]['name']}: {fail}")
 
     if failures:
         extra = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
@@ -390,9 +367,9 @@ def check_feed(feed):
         core.update_feed_state(conn, fid, **state)
 
 
-def preview_feed(url):
+def preview_feed(url, cookies=None, user_agent=None):
     """Used by the web UI to validate a URL before it is saved."""
-    res = fetch_feed(url, timeout=15)
+    res = fetch_feed(url, timeout=15, cookies=cookies, user_agent=user_agent)
     out = {"ok": not res["error"], "error": res["error"], "status": res["status"],
            "redirected_to": res["redirected_to"], "title": None, "items": [], "count": 0}
     if res["parsed"] is not None:
