@@ -2,6 +2,8 @@
 # Web dashboard. Serve with: gunicorn --bind 0.0.0.0:5000 main_web:app
 
 import os
+import sys
+import logging
 import time
 import uuid
 import hmac
@@ -16,6 +18,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 import prss_core as core
 import scheduler as sched
+import destinations as dest
+
+log = logging.getLogger("prss.web")
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("[%(asctime)s] [web] %(levelname)s %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 256
@@ -23,7 +34,6 @@ MAX_USERNAME_LEN = 64
 MAX_NAME_LEN = 120
 LOGIN_FREE_ATTEMPTS = 5
 SCHEDULER_STALE_AFTER = 45
-DISCORD_HOSTS = ("discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com")
 
 core.initialize()
 
@@ -93,26 +103,6 @@ def validate_username(name, users, exclude_id=None):
     if any(u["username"].casefold() == name.casefold() and u["id"] != exclude_id for u in users):
         return "That username is taken."
     return None
-
-
-def mask_webhook(url):
-    """discord.com/api/webhooks/1234567890/abcdef... -> discord.com/.../1234567890/abcd..."""
-    try:
-        p = urlparse(url)
-        parts = [x for x in p.path.split("/") if x]
-        if len(parts) >= 4 and parts[0] == "api" and parts[1] == "webhooks":
-            return f"{p.netloc}/api/webhooks/{parts[2]}/{parts[3][:4]}\u2026"
-        return f"{p.netloc}{p.path[:24]}\u2026" if len(p.path) > 24 else f"{p.netloc}{p.path}"
-    except Exception:
-        return "(hidden)"
-
-
-def is_discord_webhook(url):
-    try:
-        p = urlparse(url)
-        return p.scheme == "https" and p.hostname in DISCORD_HOSTS and "/api/webhooks/" in p.path
-    except Exception:
-        return False
 
 
 def host_of(url):
@@ -234,6 +224,7 @@ def csrf_protect():
     supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or ""
     if not expected or not hmac.compare_digest(str(expected), str(supplied)):
         if wants_json():
+            log.warning("Rejected %s %s: missing or stale CSRF token", request.method, request.path)
             return jsonify(ok=False, error="Your session expired. Reload the page."), 400
         flash("That form expired. Try again.", "error")
         return redirect(request.referrer or url_for("view_feeds"))
@@ -380,7 +371,9 @@ def view_feeds():
         v = feed_view(f, states.get(f["id"]), now)
         v.update(name=f["name"], url=f["url"], host=host_of(f["url"]), active=f["active"],
                  interval=f["update_interval"], interval_text=human_interval(f["update_interval"]),
-                 hooks=[{"label": h["label"], "masked": mask_webhook(h["url"])} for h in f["webhooks"]])
+                 cookies=bool(f.get("cookies")),
+                 hooks=[{"label": h["label"], "type": dest.TYPES[h["type"]]["name"], "masked": dest.describe(h)}
+                        for h in f["webhooks"]])
         feeds.append(v)
     counts = {
         "all": len(feeds),
@@ -445,27 +438,32 @@ def parse_feed_form(form):
         errors.append("Check at least once every 30 days.")
 
     hooks, seen = [], set()
-    urls = form.getlist("webhook_url")
-    labels = form.getlist("webhook_label")
-    labels += [""] * (len(urls) - len(labels))
-    for u, label in zip(urls, labels):
-        u = (u or "").strip()
-        if not u:
+    cols = {k: form.getlist(f"dest_{k}") for k in ("type", "label", "url", "target", "token")}
+    for i in range(len(cols["type"])):
+        raw = {k: (v[i] if i < len(v) else "") for k, v in cols.items()}
+        raw["label"] = (raw["label"] or "").strip()[:MAX_NAME_LEN]
+        d = dest.normalize(raw)
+        if d is None:
+            continue                     # an empty row
+        errs, warns = dest.validate(d)
+        errors.extend(errs)
+        warnings.extend(warns)
+        k = dest.identity(d)
+        if errs or k in seen:
             continue
-        if not u.startswith(("http://", "https://")):
-            errors.append(f"Destination address must start with https:// ({u[:40]}).")
-            continue
-        if u in seen:
-            continue
-        seen.add(u)
-        if not is_discord_webhook(u):
-            warnings.append(f"{label.strip() or u[:40]} does not look like a Discord webhook address.")
-        hooks.append({"url": u, "label": (label or "").strip()[:MAX_NAME_LEN]})
-    if not hooks:
-        errors.append("Add at least one Discord destination.")
+        seen.add(k)
+        hooks.append(d)
+    if not hooks and not errors:
+        errors.append("Add at least one destination.")
+
+    cookies = (form.get("cookies") or "").strip()
+    if cookies and not core.parse_cookies(cookies):
+        errors.append("The cookies could not be read. Paste them as name=value pairs, for example xf_user=...; xf_session=...")
+    user_agent = (form.get("user_agent") or "").strip()[:400]
 
     fields = {"name": name or host_of(url), "url": url, "webhooks": hooks,
-              "update_interval": max(interval, core.MIN_INTERVAL), "active": form.get("active") == "true"}
+              "update_interval": max(interval, core.MIN_INTERVAL), "active": form.get("active") == "true",
+              "cookies": cookies, "user_agent": user_agent}
     return fields, errors, warnings
 
 
@@ -479,7 +477,7 @@ def interval_parts(seconds):
 
 def render_feed_form(feed, mode):
     value, unit = interval_parts(int(feed.get("update_interval") or core.DEFAULT_INTERVAL))
-    return render_template("feed_form.html", feed=feed, mode=mode,
+    return render_template("feed_form.html", feed=feed, mode=mode, dest_types=dest.TYPES,
                            interval_value=value, interval_unit=unit)
 
 
@@ -492,7 +490,7 @@ def add_feed():
                 flash(e, "error")
             return render_feed_form(fields, "add"), 400
         with core.edit_config() as cfg:
-            cfg["FEEDS"].append({"id": str(uuid.uuid4()), **fields})
+            cfg["FEEDS"].append({"id": str(uuid.uuid4()), **fields})  # empty options dropped on save
         for w in warnings:
             flash(w, "warning")
         flash(f"Added {fields['name']}. The first check marks existing articles as seen; "
@@ -520,11 +518,14 @@ def edit_feed(feed_id):
             if target is None:
                 flash("That feed was deleted while you were editing it.", "error")
                 return redirect(url_for("view_feeds"))
-            url_changed = target["url"] != fields["url"]
+            # A different address, or different cookies (a signed-in view can
+            # show threads a guest never saw), is a different set of articles.
+            url_changed = (target["url"] != fields["url"]
+                           or (target.get("cookies") or "") != fields["cookies"])
             target.update(fields)
         if url_changed:
-            # A different feed address is a different set of articles: re-seed
-            # every destination so the new feed's backlog is not posted.
+            # Re-seed every destination so the new article set's backlog is
+            # not posted.
             with core.db() as conn, core.transaction(conn):
                 conn.execute("DELETE FROM seeded WHERE feed_id = ?", (feed_id,))
                 core.update_feed_state(conn, feed_id, etag=None, modified=None, redirected_to=None,
@@ -534,6 +535,84 @@ def edit_feed(feed_id):
         flash(f"Saved {fields['name']}.", "success")
         return redirect(url_for("view_feeds"))
     return render_feed_form(feed, "edit")
+
+
+@app.route("/feeds/bulk", methods=["GET", "POST"])
+def bulk_edit():
+    """Change the check interval and/or active state of many feeds at once."""
+    cfg = core.load_config()
+    if not cfg["FEEDS"]:
+        flash("There are no feeds to edit yet.", "warning")
+        return redirect(url_for("view_feeds"))
+    if request.method == "POST":
+        form = request.form
+        ids = set(form.getlist("feed_id"))
+        change_interval = form.get("change_interval") == "true"
+        status = form.get("status") or "keep"
+        errors = []
+        if not ids:
+            errors.append("Select at least one feed.")
+        interval = None
+        if change_interval:
+            try:
+                value = float(form.get("interval_value") or 0)
+                unit = {"seconds": 1, "minutes": 60, "hours": 3600}.get(form.get("interval_unit"), 60)
+                interval = int(value * unit)
+            except (TypeError, ValueError):
+                interval = 0
+            if interval < core.MIN_INTERVAL:
+                errors.append(f"Check at most every {core.MIN_INTERVAL} seconds.")
+            elif interval > core.MAX_INTERVAL:
+                errors.append("Check at least once every 30 days.")
+        if status not in ("keep", "active", "paused"):
+            status = "keep"
+        if not change_interval and status == "keep":
+            errors.append("Choose something to change.")
+        if errors:
+            for e in errors:
+                flash(e, "error")
+            return render_bulk_form(cfg, form), 400
+        changed = 0
+        with core.edit_config() as cfg:
+            for f in cfg["FEEDS"]:
+                if f["id"] not in ids:
+                    continue
+                before = (f["update_interval"], f["active"])
+                if interval is not None:
+                    f["update_interval"] = interval
+                if status != "keep":
+                    f["active"] = status == "active"
+                if (f["update_interval"], f["active"]) != before:
+                    changed += 1
+        parts = []
+        if interval is not None:
+            parts.append(f"checked {human_interval(interval)}")
+        if status != "keep":
+            parts.append("active" if status == "active" else "paused")
+        flash(f"Updated {changed} of {len(ids)} selected feed{'s' if len(ids) != 1 else ''}: now "
+              + " and ".join(parts) + ".", "success")
+        return redirect(url_for("view_feeds"))
+    return render_bulk_form(cfg, None)
+
+
+def render_bulk_form(cfg, form):
+    feeds = [{"id": f["id"], "name": f["name"], "host": host_of(f["url"]), "active": f["active"],
+              "interval": f["update_interval"], "interval_text": human_interval(f["update_interval"])}
+             for f in cfg["FEEDS"]]
+    groups = {}
+    for f in feeds:
+        groups.setdefault(f["interval"], []).append(f)
+    interval_groups = [{"seconds": k, "text": human_interval(k), "count": len(v)}
+                       for k, v in sorted(groups.items())]
+    selected = set(form.getlist("feed_id")) if form is not None else {f["id"] for f in feeds}
+    value, unit = interval_parts(core.DEFAULT_INTERVAL)
+    if form is not None:
+        value = form.get("interval_value") or value
+        unit = form.get("interval_unit") if form.get("interval_unit") in ("seconds", "minutes", "hours") else unit
+    return render_template("bulk_edit.html", feeds=feeds, groups=interval_groups, selected=selected,
+                           interval_value=value, interval_unit=unit,
+                           change_interval=(form is None or form.get("change_interval") == "true"),
+                           status=(form.get("status") if form is not None else "keep"))
 
 
 @app.route("/delete/<feed_id>", methods=["POST"])
@@ -611,25 +690,34 @@ def adopt_redirect(feed_id):
 
 @app.route("/api/preview", methods=["POST"])
 def api_preview():
-    url = ((request.get_json(silent=True) or {}).get("url") or "").strip()
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         return jsonify(ok=False, error="Enter an address starting with http:// or https://.")
-    return jsonify(sched.preview_feed(url))
+    cookies = (data.get("cookies") or "").strip()
+    if cookies and not core.parse_cookies(cookies):
+        return jsonify(ok=False, error="The cookies could not be read. Paste them as name=value pairs.")
+    return jsonify(sched.preview_feed(url, cookies=cookies or None,
+                                      user_agent=(data.get("user_agent") or "").strip()[:400] or None))
 
 
 @app.route("/api/test-webhook", methods=["POST"])
 def api_test_webhook():
     data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return jsonify(ok=False, error="Enter the webhook address first.")
-    label = (data.get("label") or "").strip() or "this channel"
-    ok, msg, _ = sched.send_webhook(url, {"embeds": [{
-        "title": "Hot Off The PRSS is connected",
-        "description": f"New articles for {label[:80]} will appear here.",
-        "color": sched.EMBED_COLOR,
-        "footer": {"text": f"Test sent by {g.user['username']}"},
-    }]})
+    d = dest.normalize({k: data.get(k) for k in ("type", "label", "url", "target", "token")})
+    if d is None:
+        log.info("Test destination from %s: nothing entered", g.user["username"])
+        return jsonify(ok=False, error="Fill in the destination first.")
+    errors, _ = dest.validate(d)
+    if errors:
+        return jsonify(ok=False, error=" ".join(errors))
+    label = d["label"] or "this channel"
+    ok, msg, _ = dest.send(d, dest.test_article(label, g.user["username"]))
+    name = dest.TYPES[d["type"]]["name"]
+    if ok:
+        log.info("Test %s to %s sent by %s", name, dest.describe(d), g.user["username"])
+    else:
+        log.warning("Test %s to %s failed: %s", name, dest.describe(d), msg)
     return jsonify(ok=ok, error=None if ok else msg)
 
 
