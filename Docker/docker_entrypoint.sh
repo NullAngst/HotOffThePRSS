@@ -1,4 +1,4 @@
-
+#!/bin/bash
 set -u
 
 # Run migrations once, up front, so the scheduler and every gunicorn worker
