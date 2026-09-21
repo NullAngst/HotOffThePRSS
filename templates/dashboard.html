@@ -31,6 +31,27 @@
               <option value="status">Problems first</option>
             </select>
           </label>
+          <div class="refresh" id="auto-refresh" role="group" aria-label="Auto-refresh">
+            <button type="button" class="icon-btn" id="refresh-toggle" aria-pressed="false" aria-label="Auto-refresh" title="Auto-refresh this page">
+              <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l5.5-3.5z"/></svg>
+              <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M10 9v6M14 9v6"/></svg>
+            </button>
+            <span class="refresh-count mono" id="refresh-countdown" aria-live="off" hidden></span>
+            <select id="refresh-interval" aria-label="Refresh every">
+              <option value="15">15s</option>
+              <option value="30">30s</option>
+              <option value="60">1m</option>
+              <option value="120">2m</option>
+              <option value="300">5m</option>
+              <option value="900">15m</option>
+              <option value="1800">30m</option>
+              <option value="custom">Custom</option>
+            </select>
+            <label class="refresh-custom" id="refresh-custom" hidden>
+              <input type="number" id="refresh-custom-secs" min="5" max="86400" step="1" inputmode="numeric" aria-label="Custom refresh interval in seconds">
+              <span>sec</span>
+            </label>
+          </div>
           <button type="button" class="icon-btn" id="density-toggle" aria-pressed="false" aria-label="Compact rows" title="Compact rows">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
           </button>
