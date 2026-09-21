@@ -1,18 +1,32 @@
 {% extends "base.html" %}
 {% block title %}{{ 'Add feed' if mode == 'add' else 'Edit ' ~ feed.name }}{% endblock %}
 {% block content %}
-{% macro hook_row(url='', label='') -%}
-<div class="hook-row">
-  <label class="field hook-label"><span>Channel label</span>
-    <input type="text" name="webhook_label" value="{{ label }}" placeholder="Tech server, #news" maxlength="120" autocomplete="off"></label>
-  <label class="field hook-url"><span>Webhook address</span>
-    <input type="url" name="webhook_url" value="{{ url }}" placeholder="https://discord.com/api/webhooks/…" autocomplete="off" spellcheck="false"></label>
+{% macro hook_row(h=None) -%}
+{%- set t = h.type if h else 'discord' -%}
+{%- set meta = dest_types[t] -%}
+<div class="hook-row" data-type="{{ t }}">
+  <div class="hook-fields">
+    <label class="field hook-type"><span>Service</span>
+      <select name="dest_type" class="js-dest-type">
+        {% for k, m in dest_types.items() %}<option value="{{ k }}" {% if k == t %}selected{% endif %}>{{ m.name }}</option>{% endfor %}
+      </select></label>
+    <label class="field hook-label"><span>Label</span>
+      <input type="text" name="dest_label" value="{{ h.label if h else '' }}" placeholder="Tech server, #news" maxlength="120" autocomplete="off"></label>
+    {% for f in ('url', 'target', 'token') %}
+    {%- set spec = meta.fields.get(f) -%}
+    <label class="field hook-f hook-{{ f }}" data-field="{{ f }}" {% if not spec %}hidden{% endif %}><span class="js-flabel">{{ spec[0] if spec else '' }}</span>
+      <input type="{{ 'password' if f == 'token' else 'text' }}" name="dest_{{ f }}" value="{{ (h[f] if h and h[f] is defined else '') }}"
+             placeholder="{{ spec[1] if spec else '' }}" autocomplete="{{ 'new-password' if f == 'token' else 'off' }}" spellcheck="false"
+             {% if f == 'url' %}inputmode="url"{% endif %}></label>
+    {% endfor %}
+  </div>
   <div class="hook-actions">
     <button type="button" class="btn btn-sm js-test-hook">Send test</button>
     <button type="button" class="icon-btn js-remove-hook" aria-label="Remove this destination" title="Remove">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
     </button>
   </div>
+  <p class="hint hook-help js-dest-help">{{ meta.help }}</p>
   <p class="hook-result" aria-live="polite"></p>
 </div>
 {%- endmacro %}
@@ -24,7 +38,7 @@
     {% if mode == 'add' %}<p class="lede">When a feed is added, everything already in it is marked as seen. Only articles published after that point are posted.</p>{% endif %}
   </header>
 
-  <form method="post" class="feed-form" id="feed-form" data-preview-url="{{ url_for('api_preview') }}" data-test-url="{{ url_for('api_test_webhook') }}">
+  <form method="post" class="feed-form" id="feed-form" data-preview-url="{{ url_for('api_preview') }}" data-test-url="{{ url_for('api_test_webhook') }}" data-dest-types='{{ dest_types|tojson }}'>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
     <fieldset class="panel">
@@ -36,18 +50,28 @@
       </div>
       <div class="preview" id="preview" hidden aria-live="polite"></div>
       <label class="field"><span>Name</span>
-        <input type="text" name="name" id="feed-name" value="{{ feed.name if feed.name != feed.url else '' }}" maxlength="120" placeholder="Shown in the footer of every Discord post">
+        <input type="text" name="name" id="feed-name" value="{{ feed.name if feed.name != feed.url else '' }}" maxlength="120" placeholder="Shown with every post">
         <small>Leave empty to use the site's address. Preview fills this in from the feed's own title.</small></label>
+      <details class="access"{% if feed.cookies or feed.user_agent %} open{% endif %}>
+        <summary>Access: cookies and User-Agent{% if feed.cookies %} <span class="tag">cookies set</span>{% endif %}</summary>
+        <p class="hint">For feeds that only show everything to signed-in members, such as a XenForo forum. Sign in to the site in your browser with <b>Stay logged in</b> ticked, then copy its cookies from the developer tools (Storage or Application, Cookies). For XenForo, <code>xf_user</code> is the one that matters; adding <code>xf_session</code> does no harm. Signing out of the site in that browser invalidates the cookie, so a private window you simply close works best.</p>
+        <label class="field"><span>Cookies</span>
+          <textarea name="cookies" id="feed-cookies" rows="3" class="mono" spellcheck="false" autocomplete="off" placeholder="xf_user=123%2Cabcdef...; xf_session=...">{{ feed.cookies or '' }}</textarea>
+          <small>Accepts <code>name=value; name=value</code>, one per line, a cookies.txt export, or a cookie-editor JSON export. Sent only to this feed's own host. Stored in config.json like webhook addresses, so treat backups as secret.</small></label>
+        <label class="field"><span>User-Agent</span>
+          <input type="text" name="user_agent" id="feed-ua" value="{{ feed.user_agent or '' }}" maxlength="400" spellcheck="false" autocomplete="off" placeholder="Leave empty for the default browser User-Agent">
+          <small>Some sites tie a login to the browser that created it. If cookies alone do not work, paste the User-Agent of the browser you signed in with.</small></label>
+      </details>
     </fieldset>
 
     <fieldset class="panel">
       <legend>Destinations</legend>
-      <p class="hint">Create a webhook in Discord under Channel settings, Integrations, Webhooks, then paste its address here. A feed can post to any number of channels, and each channel tracks what it has received on its own.</p>
+      <p class="hint">A feed can post to any number of destinations on any mix of services, and each one tracks what it has received on its own.</p>
       <div id="hooks">
-        {% for h in feed.webhooks %}{{ hook_row(h.url, h.label) }}{% else %}{{ hook_row() }}{% endfor %}
+        {% for h in feed.webhooks %}{{ hook_row(h) }}{% else %}{{ hook_row() }}{% endfor %}
       </div>
       <template id="hook-template">{{ hook_row() }}</template>
-      <button type="button" class="btn btn-quiet" id="add-hook">Add another channel</button>
+      <button type="button" class="btn btn-quiet" id="add-hook">Add another destination</button>
     </fieldset>
 
     <fieldset class="panel">
