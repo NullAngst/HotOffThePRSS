@@ -402,7 +402,142 @@
     updateCounts();
     applySort();
     applyFilters();
+    restoreView();
+    initAutoRefresh();
     schedulePoll(10000);
+
+    // --- Auto-refresh ---------------------------------------------------------
+    // Live polling above keeps existing rows current. A full reload also picks
+    // up feeds that were added, removed or renamed elsewhere. The view (filter,
+    // search, open rows, scroll position) is carried across the reload.
+    // Uses the same localStorage keys as earlier versions.
+    function saveView() {
+      var open = Array.prototype.slice.call(board.querySelectorAll('.expand[aria-expanded="true"]'))
+        .map(function (b) { var f = b.closest(".feed"); return f && f.dataset.id; })
+        .filter(Boolean);
+      try {
+        sessionStorage.setItem("prss.view", JSON.stringify({
+          filter: filter, q: search ? search.value : "", open: open, y: window.scrollY
+        }));
+      } catch (e) { /* storage blocked: reload without restoring */ }
+    }
+    function restoreView() {
+      var v = null;
+      try { v = JSON.parse(sessionStorage.getItem("prss.view") || "null"); sessionStorage.removeItem("prss.view"); } catch (e) { v = null; }
+      if (!v) return;
+      if (search && typeof v.q === "string") search.value = v.q;
+      var chip = document.querySelector('.chip[data-filter="' + v.filter + '"]');
+      if (chip) chip.click(); else applyFilters();
+      (v.open || []).forEach(function (id) {
+        var f = list && list.querySelector('.feed[data-id="' + id + '"]');
+        var b = f && f.querySelector(".expand");
+        if (b && b.getAttribute("aria-expanded") !== "true") b.click();
+      });
+      if (v.y) window.scrollTo(0, v.y);
+    }
+
+    function initAutoRefresh() {
+      var toggle = document.getElementById("refresh-toggle");
+      var sel = document.getElementById("refresh-interval");
+      var count = document.getElementById("refresh-countdown");
+      var customWrap = document.getElementById("refresh-custom");
+      var customIn = document.getElementById("refresh-custom-secs");
+      if (!toggle || !sel || !count) return;
+
+      var MIN = 5, MAX = 86400;
+      var active = store.get("autoRefreshActive") === "true";
+      var seconds = parseInt(store.get("autoRefreshInterval"), 10);
+      if (!(seconds >= MIN && seconds <= MAX)) seconds = 30;
+      var remaining = seconds;
+      var timer = null;
+
+      function presetFor(n) { return sel.querySelector('option[value="' + n + '"]') ? String(n) : "custom"; }
+      function fmt(n) {
+        if (n < 60) return n + "s";
+        var m = Math.floor(n / 60), r = n % 60;
+        if (m < 60) return m + ":" + (r < 10 ? "0" : "") + r;
+        var h = Math.floor(m / 60), mm = m % 60;
+        return h + ":" + (mm < 10 ? "0" : "") + mm + ":" + (r < 10 ? "0" : "") + r;
+      }
+      // Hold the reload while someone is typing, dragging or picking a value,
+      // so it never yanks the page out from under them.
+      function busy() {
+        if (dragging) return true;
+        var a = document.activeElement;
+        return !!(a && a !== document.body && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName));
+      }
+      function render() {
+        toggle.setAttribute("aria-pressed", active ? "true" : "false");
+        toggle.title = active ? "Auto-refresh is on. Click to stop." : "Auto-refresh this page";
+        count.hidden = !active;
+        if (active) count.textContent = remaining > 0 ? fmt(remaining) : "wait";
+        count.dataset.waiting = active && remaining <= 0 ? "true" : "false";
+        var custom = sel.value === "custom";
+        if (customWrap) customWrap.hidden = !custom;
+      }
+      function tick() {
+        if (document.hidden) return;          // countdown pauses in a background tab
+        if (remaining > 0) remaining--;
+        if (remaining <= 0 && !busy()) {
+          clearInterval(timer);
+          saveView();
+          window.location.reload();
+          return;
+        }
+        render();
+      }
+      function start() {
+        clearInterval(timer);
+        remaining = seconds;
+        timer = setInterval(tick, 1000);
+        render();
+      }
+      function stop() {
+        clearInterval(timer);
+        timer = null;
+        render();
+      }
+      function setSeconds(n) {
+        n = Math.round(n);
+        if (!(n >= MIN)) n = MIN;
+        if (n > MAX) n = MAX;
+        seconds = n;
+        store.set("autoRefreshInterval", String(n));
+        if (customIn) customIn.value = n;
+        if (active) start(); else render();
+      }
+
+      sel.value = presetFor(seconds);
+      if (customIn) customIn.value = seconds;
+
+      toggle.addEventListener("click", function () {
+        active = !active;
+        store.set("autoRefreshActive", active ? "true" : "false");
+        if (active) start(); else stop();
+      });
+      sel.addEventListener("change", function () {
+        if (sel.value === "custom") {
+          render();
+          if (customIn) { customIn.focus(); customIn.select(); }
+          return;
+        }
+        setSeconds(parseInt(sel.value, 10));
+        sel.blur();
+      });
+      if (customIn) {
+        customIn.addEventListener("change", function () {
+          var n = parseInt(customIn.value, 10);
+          if (isNaN(n)) { customIn.value = seconds; return; }
+          setSeconds(n);
+        });
+        customIn.addEventListener("keydown", function (e) {
+          if (e.key === "Enter") { e.preventDefault(); customIn.blur(); }
+          if (e.key === "Escape") { customIn.value = seconds; customIn.blur(); }
+        });
+      }
+      // Coming back to the tab resumes the countdown where it left off.
+      if (active) start(); else render();
+    }
   }
 
   // --- Feed form -------------------------------------------------------------
