@@ -4,7 +4,7 @@
 # Layout of the data directory (PRSS_DATA_DIR, defaults to the script dir so
 # existing installs keep working without any changes):
 #
-#   config.json      feeds and webhook destinations (human readable, backed up)
+#   config.json      feeds and their destinations (human readable, backed up)
 #   user.json        user accounts (hashed passwords)
 #   secret.key       Flask session signing key
 #   prss_state.db    SQLite: sent-article memory, feed health, delivery log,
@@ -25,6 +25,8 @@ import hashlib
 import tempfile
 import contextlib
 
+import destinations as dest
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.abspath(os.environ.get("PRSS_DATA_DIR") or SCRIPT_DIR)
 
@@ -35,7 +37,9 @@ DB_FILE = os.path.join(DATA_DIR, "prss_state.db")
 LEGACY_SENT_FILE = os.path.join(DATA_DIR, "sent_articles.yaml")
 LEGACY_STATE_FILE = os.path.join(DATA_DIR, "feed_state.json")
 
-CONFIG_VERSION = 2
+# 2: normalized ids and webhooks.  3: destination types (Discord, Slack,
+# Matrix, ...), per-feed cookies and User-Agent.
+CONFIG_VERSION = 3
 DB_SCHEMA_VERSION = 1
 
 MIN_INTERVAL = 30
@@ -115,6 +119,13 @@ def webhook_key(url):
     return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:32]
 
 
+def dest_key(d):
+    """Memory key for any destination type. For Discord (and the other
+    URL-only types) this equals webhook_key(url), so memory from earlier
+    versions stays attached to the same destination."""
+    return dest.key(d)
+
+
 # --- Config -------------------------------------------------------------------
 
 def _as_bool(value, default=True):
@@ -142,7 +153,7 @@ def _legacy_webhooks(feed):
     if isinstance(hooks, list):
         for h in hooks:
             if isinstance(h, dict):
-                out.append({"url": h.get("url"), "label": h.get("label")})
+                out.append(dict(h))
             elif isinstance(h, str):
                 out.append({"url": h, "label": ""})
     urls = feed.get("webhook_urls")
@@ -192,16 +203,28 @@ def normalize_config(data):
         f["update_interval"] = _as_interval(f.get("update_interval"))
         f["active"] = _as_bool(f.get("active"), True)
 
-        hooks, seen_urls = [], set()
+        hooks, seen_keys = [], set()
         for h in _legacy_webhooks(feed):
-            hu = str(h.get("url") or "").strip()
-            if not hu or hu in seen_urls:
+            d = dest.normalize(h)
+            if d is None:
                 continue
-            seen_urls.add(hu)
-            hooks.append({"url": hu, "label": str(h.get("label") or "").strip()})
+            k = dest.identity(d)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            hooks.append(d)
         f["webhooks"] = hooks
         f.pop("webhook_urls", None)
         f.pop("webhook_url", None)
+
+        # Optional fetch settings. Stored only when set.
+        for opt in ("cookies", "user_agent"):
+            v = f.get(opt)
+            v = str(v).strip() if isinstance(v, (str, int, float)) else ""
+            if v:
+                f[opt] = v
+            else:
+                f.pop(opt, None)
         feeds.append(f)
 
     out = dict(data)
@@ -254,6 +277,58 @@ def edit_config():
 
 def find_feed(cfg, feed_id):
     return next((f for f in cfg["FEEDS"] if f["id"] == feed_id), None)
+
+
+# --- Fetch cookies --------------------------------------------------------------
+
+def parse_cookies(text):
+    """Parse cookies pasted by a user. Returns a list of (name, value).
+
+    Accepts a Cookie header ("a=1; b=2", optionally prefixed "Cookie:"), one
+    name=value per line, a Netscape cookies.txt export, or the JSON array that
+    browser cookie-editor extensions export. Values are kept exactly as pasted
+    (no URL-decoding), since that is how the browser sends them.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    out = []
+    if text.startswith("["):
+        try:
+            for c in json.loads(text):
+                if isinstance(c, dict) and c.get("name"):
+                    out.append((str(c["name"]).strip(), str(c.get("value", ""))))
+            return _dedupe_cookies(out)
+        except (ValueError, TypeError):
+            pass
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        cols = line.split("\t")
+        if len(cols) == 7:                      # Netscape cookies.txt
+            out.append((cols[5].strip(), cols[6].strip()))
+            continue
+        if line.lower().startswith("cookie:"):
+            line = line[7:]
+        for part in line.split(";"):
+            name, sep, value = part.partition("=")
+            name = name.strip()
+            if sep and name and name.lower() not in ("path", "domain", "expires", "max-age",
+                                                     "secure", "httponly", "samesite"):
+                out.append((name, value.strip()))
+    return _dedupe_cookies(out)
+
+
+def _dedupe_cookies(pairs):
+    seen, out = {}, []
+    for name, value in pairs:
+        if name in seen:
+            out[seen[name]] = (name, value)
+        else:
+            seen[name] = len(out)
+            out.append((name, value))
+    return out
 
 
 # --- Users --------------------------------------------------------------------
@@ -488,7 +563,7 @@ def _load_legacy_yaml(path):
 def _migrate_legacy_state(conn, cfg):
     """Import sent_articles.yaml and feed_state.json (pre-SQLite versions)."""
     now = time.time()
-    all_hook_urls = sorted({h["url"] for f in cfg["FEEDS"] for h in f["webhooks"]})
+    all_hook_urls = sorted({h["url"] for f in cfg["FEEDS"] for h in f["webhooks"] if h["type"] == "discord"})
     known_keys = set()
     report = []
 
@@ -558,7 +633,7 @@ def _migrate_legacy_state(conn, cfg):
             if f["id"] not in state:
                 continue
             for h in f["webhooks"]:
-                k = webhook_key(h["url"])
+                k = dest_key(h)
                 if k in known_keys:
                     conn.execute(
                         "INSERT OR IGNORE INTO seeded(feed_id, webhook, seeded_at) VALUES (?,?,?)",
@@ -582,10 +657,11 @@ def initialize():
                     raw = json.load(f)
                 cfg, changed = normalize_config(raw)
                 if changed:
-                    backup_copy(CONFIG_FILE, "pre-v2")
+                    tag = f"pre-v{CONFIG_VERSION}"
+                    backup_copy(CONFIG_FILE, tag)
                     with file_lock("config"):
                         save_config(cfg)
-                    report.append("config.json normalized (backup: config.json.pre-v2.bak)")
+                    report.append(f"config.json upgraded to version {CONFIG_VERSION} (backup: config.json.{tag}.bak)")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 report.append(f"config.json is corrupt ({e}); left untouched")
         else:
@@ -676,7 +752,7 @@ def prune_state(conn, cfg):
     """Drop state for feeds and destinations that no longer exist."""
     now = time.time()
     feed_ids = {f["id"] for f in cfg["FEEDS"]}
-    pairs = {(f["id"], webhook_key(h["url"])) for f in cfg["FEEDS"] for h in f["webhooks"]}
+    pairs = {(f["id"], dest_key(h)) for f in cfg["FEEDS"] for h in f["webhooks"]}
     live_hooks = {k for _, k in pairs}
     with transaction(conn):
         for r in conn.execute("SELECT feed_id FROM feed_state").fetchall():
