@@ -19,7 +19,7 @@ import prss_core as core
 
 USER_AGENT = os.environ.get(
     "PRSS_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
 )
 feedparser.USER_AGENT = USER_AGENT
 
