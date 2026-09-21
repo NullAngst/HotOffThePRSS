@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Backup{% endblock %}
+{% block content %}
+<div class="form-page">
+  <header class="form-head">
+    <h1>Backup and restore</h1>
+    <p class="lede">Feed backups include full webhook addresses. Anyone holding the file can post to those channels, so store it like a password.</p>
+  </header>
+
+  <section class="panel">
+    <h2>Feeds</h2>
+    <p class="hint">{{ feed_count }} feed{{ '' if feed_count == 1 else 's' }} and {{ hook_count }} destination{{ '' if hook_count == 1 else 's' }}, in your chosen order.</p>
+    <div class="split">
+      <div>
+        <h3>Download</h3>
+        <p>Saves config.json. Backups from older versions restore fine; they are converted on upload.</p>
+        <a class="btn" href="{{ url_for('download_backup') }}" download>Download config.json</a>
+      </div>
+      <form method="post" action="{{ url_for('upload_backup') }}" enctype="multipart/form-data" data-confirm="Replace all {{ feed_count }} feeds with the ones in this file? A copy of the current config is kept next to it on the server.">
+        <h3>Restore</h3>
+        <p>Replaces every feed. Articles already seen are not posted again, and destinations this server has never posted to are seeded first.</p>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="file"><input type="file" name="backup_file" accept=".json,application/json" required><span>Choose config.json</span></label>
+        <button type="submit" class="btn btn-danger">Restore feeds</button>
+      </form>
+    </div>
+  </section>
+
+  {% if g.user.role == 'owner' %}
+  <section class="panel">
+    <h2>User database</h2>
+    <p class="hint">{{ user_count }} account{{ '' if user_count == 1 else 's' }}. Passwords are stored as salted hashes. Only the Owner can see this section.</p>
+    <div class="split">
+      <div>
+        <h3>Download</h3>
+        <p>Saves user.json for moving accounts to another install.</p>
+        <a class="btn" href="{{ url_for('download_users_backup') }}" download>Download user.json</a>
+      </div>
+      <form method="post" action="{{ url_for('upload_users_backup') }}" enctype="multipart/form-data" data-confirm="Replace every account with the ones in this file? You will be signed out and must sign in with an account from the backup.">
+        <h3>Restore</h3>
+        <p>Replaces every account and signs everyone out. The file must contain an Owner.</p>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label class="file"><input type="file" name="backup_file" accept=".json,application/json" required><span>Choose user.json</span></label>
+        <button type="submit" class="btn btn-danger">Restore users</button>
+      </form>
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

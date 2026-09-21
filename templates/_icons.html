@@ -1,0 +1,11 @@
+{% macro status_glyph(status) -%}
+<svg class="glyph" viewBox="0 0 16 16" aria-hidden="true">
+{%- if status == 'ok' -%}<circle cx="8" cy="8" r="5"/>
+{%- elif status == 'redirected' -%}<path d="M8 2.5 13.5 8 8 13.5 2.5 8z"/>
+{%- elif status == 'error' -%}<rect x="3" y="3" width="10" height="10" rx="1.5"/><path class="knock" d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/>
+{%- elif status in ('checking','queued') -%}<circle class="spin" cx="8" cy="8" r="5"/>
+{%- elif status == 'paused' -%}<path d="M5.5 3.5v9M10.5 3.5v9"/>
+{%- else -%}<circle class="ring" cx="8" cy="8" r="5"/>
+{%- endif -%}
+</svg>
+{%- endmacro %}

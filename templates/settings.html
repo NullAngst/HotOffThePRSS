@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<div class="form-page">
+  <header class="form-head"><h1>Settings</h1></header>
+
+  <section class="panel">
+    <h2>Your password</h2>
+    <p class="hint">Changing it signs you out everywhere else.</p>
+    <form method="post" action="{{ url_for('change_password') }}" class="grid-3">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="text" name="username" value="{{ g.user.username }}" autocomplete="username" hidden>
+      <label class="field"><span>Current password</span>
+        <input type="password" name="current_password" required autocomplete="current-password"></label>
+      <label class="field"><span>New password</span>
+        <input type="password" name="new_password" required minlength="8" maxlength="256" autocomplete="new-password"></label>
+      <label class="field"><span>Confirm new password</span>
+        <input type="password" name="confirm" required minlength="8" maxlength="256" autocomplete="new-password"></label>
+      <div class="form-actions span-all"><button type="submit" class="btn btn-primary">Change password</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>People</h2>
+      {% if rank(g.user.role) >= 2 %}<a class="btn btn-sm" href="{{ url_for('add_user') }}">Add a person</a>{% endif %}
+    </div>
+    <p class="hint">Admins manage feeds. Super Admins also manage Admins and can back up feeds. The Owner manages everyone and the user database.</p>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th scope="col">Username</th><th scope="col">Role</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+        <tbody>
+        {% for u in users %}
+        <tr>
+          <td>{{ u.username }}{% if u.id == g.user.id %} <span class="tag">You</span>{% endif %}</td>
+          <td>
+            {% if g.user.role == 'owner' and can_manage(g.user, u) %}
+            <form method="post" action="{{ url_for('set_role', user_id=u.id) }}" class="inline-form js-autosubmit">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <select name="role" aria-label="Role for {{ u.username }}">
+                <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>Admin</option>
+                <option value="super_admin" {% if u.role == 'super_admin' %}selected{% endif %}>Super Admin</option>
+              </select>
+              <noscript><button type="submit" class="btn btn-sm">Save</button></noscript>
+            </form>
+            {% else %}
+            <span class="role role-{{ u.role }}">{{ {'owner':'Owner','super_admin':'Super Admin','admin':'Admin'}[u.role] }}</span>
+            {% endif %}
+          </td>
+          <td class="row-actions">
+            {% if can_manage(g.user, u) %}
+            <a class="btn btn-sm btn-quiet" href="{{ url_for('reset_password_page', user_id=u.id) }}">Set password</a>
+            <form method="post" action="{{ url_for('delete_user', user_id=u.id) }}" data-confirm="Delete {{ u.username }}? They are signed out immediately.">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="btn btn-sm btn-danger-quiet">Delete</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

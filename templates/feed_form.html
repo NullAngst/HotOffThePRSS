@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Add feed' if mode == 'add' else 'Edit ' ~ feed.name }}{% endblock %}
+{% block content %}
+{% macro hook_row(url='', label='') -%}
+<div class="hook-row">
+  <label class="field hook-label"><span>Channel label</span>
+    <input type="text" name="webhook_label" value="{{ label }}" placeholder="Tech server, #news" maxlength="120" autocomplete="off"></label>
+  <label class="field hook-url"><span>Webhook address</span>
+    <input type="url" name="webhook_url" value="{{ url }}" placeholder="https://discord.com/api/webhooks/…" autocomplete="off" spellcheck="false"></label>
+  <div class="hook-actions">
+    <button type="button" class="btn btn-sm js-test-hook">Send test</button>
+    <button type="button" class="icon-btn js-remove-hook" aria-label="Remove this destination" title="Remove">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <p class="hook-result" aria-live="polite"></p>
+</div>
+{%- endmacro %}
+
+<div class="form-page">
+  <header class="form-head">
+    <a class="back" href="{{ url_for('view_feeds') }}">Back to feeds</a>
+    <h1>{{ 'Add a feed' if mode == 'add' else feed.name }}</h1>
+    {% if mode == 'add' %}<p class="lede">When a feed is added, everything already in it is marked as seen. Only articles published after that point are posted.</p>{% endif %}
+  </header>
+
+  <form method="post" class="feed-form" id="feed-form" data-preview-url="{{ url_for('api_preview') }}" data-test-url="{{ url_for('api_test_webhook') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <fieldset class="panel">
+      <legend>Source</legend>
+      <div class="field-row">
+        <label class="field grow"><span>Feed address</span>
+          <input type="url" name="url" id="feed-url" value="{{ feed.url }}" required placeholder="https://example.com/feed.xml" spellcheck="false" autocomplete="off"></label>
+        <button type="button" class="btn" id="preview-btn">Preview</button>
+      </div>
+      <div class="preview" id="preview" hidden aria-live="polite"></div>
+      <label class="field"><span>Name</span>
+        <input type="text" name="name" id="feed-name" value="{{ feed.name if feed.name != feed.url else '' }}" maxlength="120" placeholder="Shown in the footer of every Discord post">
+        <small>Leave empty to use the site's address. Preview fills this in from the feed's own title.</small></label>
+    </fieldset>
+
+    <fieldset class="panel">
+      <legend>Destinations</legend>
+      <p class="hint">Create a webhook in Discord under Channel settings, Integrations, Webhooks, then paste its address here. A feed can post to any number of channels, and each channel tracks what it has received on its own.</p>
+      <div id="hooks">
+        {% for h in feed.webhooks %}{{ hook_row(h.url, h.label) }}{% else %}{{ hook_row() }}{% endfor %}
+      </div>
+      <template id="hook-template">{{ hook_row() }}</template>
+      <button type="button" class="btn btn-quiet" id="add-hook">Add another channel</button>
+    </fieldset>
+
+    <fieldset class="panel">
+      <legend>Schedule</legend>
+      <div class="field-row">
+        <label class="field"><span>Check every</span>
+          <input type="number" name="interval_value" value="{{ interval_value }}" min="1" step="any" required class="num"></label>
+        <label class="field"><span class="sr">Unit</span>
+          <select name="interval_unit">
+            {% for u in ('seconds', 'minutes', 'hours') %}<option value="{{ u }}" {% if u == interval_unit %}selected{% endif %}>{{ u }}</option>{% endfor %}
+          </select></label>
+      </div>
+      <p class="hint">The shortest allowed interval is 30 seconds. Most news sites update a few times an hour, so 5 to 15 minutes is plenty.</p>
+      <label class="switch">
+        <input type="checkbox" name="active" value="true" {% if feed.active %}checked{% endif %}>
+        <span class="switch-track" aria-hidden="true"></span>
+        <span>Active <small>Paused feeds are skipped until you resume them.</small></span>
+      </label>
+    </fieldset>
+
+    <div class="form-actions">
+      <a class="btn btn-quiet" href="{{ url_for('view_feeds') }}">Cancel</a>
+      <button type="submit" class="btn btn-primary">{{ 'Add feed' if mode == 'add' else 'Save changes' }}</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

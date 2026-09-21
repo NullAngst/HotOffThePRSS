@@ -1,0 +1,17 @@
+{% extends "auth_base.html" %}
+{% block title %}First-time setup{% endblock %}
+{% block auth %}
+<h1>Create the owner account</h1>
+<p class="lede">This account has full control, including user management and user backups. It can not be deleted or demoted later.</p>
+<form method="post" class="stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label class="field"><span>Username</span>
+    <input type="text" name="username" value="{{ username }}" autocomplete="username" required autofocus maxlength="64"></label>
+  <label class="field"><span>Password</span>
+    <input type="password" name="password" autocomplete="new-password" required minlength="8" maxlength="256">
+    <small>At least 8 characters.</small></label>
+  <label class="field"><span>Confirm password</span>
+    <input type="password" name="confirm" autocomplete="new-password" required minlength="8" maxlength="256"></label>
+  <button type="submit" class="btn btn-primary btn-block">Create owner account</button>
+</form>
+{% endblock %}

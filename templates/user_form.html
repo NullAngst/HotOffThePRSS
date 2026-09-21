@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Add a person{% endblock %}
+{% block content %}
+<div class="form-page narrow">
+  <header class="form-head">
+    <a class="back" href="{{ url_for('settings') }}">Back to settings</a>
+    <h1>Add a person</h1>
+  </header>
+  <form method="post" class="panel stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="field"><span>Username</span>
+      <input type="text" name="username" value="{{ username }}" required maxlength="64" autocomplete="off"></label>
+    <label class="field"><span>Temporary password</span>
+      <input type="password" name="password" required minlength="8" maxlength="256" autocomplete="new-password">
+      <small>Share it with them privately. They can change it under Settings.</small></label>
+    {% if g.user.role == 'owner' %}
+    <label class="field"><span>Role</span>
+      <select name="role">
+        <option value="admin" {% if role == 'admin' %}selected{% endif %}>Admin: manages feeds</option>
+        <option value="super_admin" {% if role == 'super_admin' %}selected{% endif %}>Super Admin: also manages Admins and feed backups</option>
+      </select></label>
+    {% endif %}
+    <div class="form-actions">
+      <a class="btn btn-quiet" href="{{ url_for('settings') }}">Cancel</a>
+      <button type="submit" class="btn btn-primary">Create account</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
