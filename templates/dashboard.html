@@ -67,7 +67,7 @@
     <div class="feed-list" id="feed-list">
       {% for f in feeds %}
       <article class="feed" data-id="{{ f.id }}" data-status="{{ f.status }}" data-attention="{{ 'true' if f.attention else 'false' }}"
-               data-active="{{ 'true' if f.active else 'false' }}" data-name="{{ f.name|lower }}" data-url="{{ f.url|lower }}"
+               data-active="{{ 'true' if f.active else 'false' }}" data-name="{{ f.name|lower }}" data-url="{{ f.search_urls }}"
                data-post="{{ f.last_post_time or 0 }}" data-order="{{ loop.index0 }}" aria-label="{{ f.name }}">
         <div class="feed-row">
           <button type="button" class="drag" aria-label="Reorder {{ f.name }}. Use arrow keys to move." title="Drag to reorder">
@@ -78,7 +78,7 @@
           </div>
           <div class="c-name">
             <a class="feed-name" href="{{ url_for('edit_feed', feed_id=f.id) }}">{{ f.name }}</a>
-            <span class="feed-host">{{ f.host }}</span>
+            <span class="feed-host">{{ f.host }}{% if f.sources|length > 1 %} <span class="tag">{{ f.sources|length }} sources</span>{% endif %}</span>
           </div>
           <div class="c-dest">
             {% if f.hooks %}
@@ -116,20 +116,35 @@
         <div class="feed-detail" id="detail-{{ f.id }}" hidden>
           <div class="detail-grid">
             <div class="detail-block">
+              {% if f.sources|length == 1 %}
               <h3>Feed address</h3>
               <p class="mono selectable">{{ f.url }}</p>
+              {% else %}
+              <h3>Sources ({{ f.sources|length }})</h3>
+              <ul class="source-list">
+                {% for src in f.sources %}
+                <li class="{{ 'is-bad' if src.error }}">
+                  <p class="mono selectable">{{ src.url }}</p>
+                  {% if src.error %}<p class="source-status bad">{{ src.error }}{% if src.failures > 1 %} ({{ src.failures }} times in a row){% endif %}{% if src.last_success %}. Last worked <time data-ts="{{ src.last_success }}" datetime="{{ src.last_success|iso }}">{{ src.last_success|ago }}</time>{% endif %}</p>
+                  {% elif src.checked %}<p class="source-status ok">Working</p>
+                  {% else %}<p class="source-status muted">Not checked yet</p>{% endif %}
+                </li>
+                {% endfor %}
+              </ul>
+              {% endif %}
               {% if f.cookies %}<p class="muted"><span class="tag">cookies</span> Fetched with saved cookies.</p>{% endif %}
-              {% if f.redirected_to %}
+              {% for src in f.sources if src.redirected_to %}
               <div class="callout callout-warn">
-                <p>This feed now answers from a different address. Updating it avoids an extra request on every check and keeps working if the old address stops redirecting.</p>
-                <p class="mono selectable">{{ f.redirected_to }}</p>
+                <p>{% if f.sources|length == 1 %}This feed{% else %}<span class="mono">{{ src.url }}</span>{% endif %} now answers from a different address. Updating it avoids an extra request on every check and keeps working if the old address stops redirecting.</p>
+                <p class="mono selectable">{{ src.redirected_to }}</p>
                 <form method="post" action="{{ url_for('adopt_redirect', feed_id=f.id) }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="source" value="{{ src.url }}">
                   <button type="submit" class="btn btn-sm">Use the new address</button>
                 </form>
               </div>
-              {% endif %}
-              {% if f.error %}
+              {% endfor %}
+              {% if f.error and f.sources|length == 1 %}
               <div class="callout callout-bad"><p><strong>Last check failed:</strong> {{ f.error }}{% if f.failures > 1 %} ({{ f.failures }} times in a row){% endif %}.
                 {% if f.last_success %}Last successful check <time data-ts="{{ f.last_success }}" datetime="{{ f.last_success|iso }}">{{ f.last_success|ago }}</time>.{% endif %}</p></div>
               {% endif %}

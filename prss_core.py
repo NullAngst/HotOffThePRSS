@@ -38,9 +38,12 @@ LEGACY_SENT_FILE = os.path.join(DATA_DIR, "sent_articles.yaml")
 LEGACY_STATE_FILE = os.path.join(DATA_DIR, "feed_state.json")
 
 # 2: normalized ids and webhooks.  3: destination types (Discord, Slack,
-# Matrix, ...), per-feed cookies and User-Agent.
-CONFIG_VERSION = 3
-DB_SCHEMA_VERSION = 1
+# Matrix, ...), per-feed cookies and User-Agent.  4: extra source addresses
+# per feed ("extra_urls").
+CONFIG_VERSION = 4
+# 1: initial SQLite layout.  2: per-source state (source_state).
+DB_SCHEMA_VERSION = 2
+MAX_SOURCES = 20
 
 MIN_INTERVAL = 30
 MAX_INTERVAL = 86400 * 30
@@ -217,6 +220,24 @@ def normalize_config(data):
         f.pop("webhook_urls", None)
         f.pop("webhook_url", None)
 
+        # Additional source addresses. "url" stays the first source, so a feed
+        # with one source looks exactly like it did before, and an older
+        # version reading this file still fetches the first source.
+        extra, seen_src = [], {url}
+        raw_extra = f.get("extra_urls")
+        if isinstance(raw_extra, str):
+            raw_extra = [raw_extra]
+        for u in raw_extra if isinstance(raw_extra, list) else []:
+            u = str(u or "").strip()
+            if u and u not in seen_src and u.startswith(("http://", "https://")):
+                seen_src.add(u)
+                extra.append(u)
+        extra = extra[:MAX_SOURCES - 1]
+        if extra:
+            f["extra_urls"] = extra
+        else:
+            f.pop("extra_urls", None)
+
         # Optional fetch settings. Stored only when set.
         for opt in ("cookies", "user_agent"):
             v = f.get(opt)
@@ -273,6 +294,11 @@ def edit_config():
         cfg = load_config()
         yield cfg
         save_config(cfg)
+
+
+def feed_urls(feed):
+    """Every source address of a feed, primary first."""
+    return [feed["url"], *feed.get("extra_urls", [])]
 
 
 def find_feed(cfg, feed_id):
@@ -478,6 +504,20 @@ CREATE TABLE IF NOT EXISTS feed_state (
     force_requested  REAL,
     checking_since   REAL
 );
+CREATE TABLE IF NOT EXISTS source_state (
+    feed_id       TEXT NOT NULL,
+    url           TEXT NOT NULL,
+    status_code   INTEGER,
+    error         TEXT,
+    redirected_to TEXT,
+    redirect_code INTEGER,
+    last_checked  REAL,
+    last_success  REAL,
+    failures      INTEGER NOT NULL DEFAULT 0,
+    etag          TEXT,
+    modified      TEXT,
+    PRIMARY KEY (feed_id, url)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS deliveries (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ts            REAL NOT NULL,
@@ -689,11 +729,37 @@ def initialize():
                 cfg = load_config()
                 with transaction(conn):
                     report += _migrate_legacy_state(conn, cfg)
-                    set_meta(conn, "schema_version", DB_SCHEMA_VERSION)
+                    set_meta(conn, "schema_version", 1)
                 for path in (LEGACY_SENT_FILE, LEGACY_STATE_FILE):
                     if os.path.exists(path):
                         os.replace(path, path + ".migrated")
-            # Future schema upgrades go here: `if version < 2: ...`
+            if version < 2:
+                # Per-source state. Each feed's existing health and cache
+                # headers move to its (only) source, so a feed that has
+                # already been running is not treated as a new source.
+                cfg = load_config()
+                primary = {f["id"]: f["url"] for f in cfg["FEEDS"]}
+                with transaction(conn):
+                    moved = 0
+                    for r in conn.execute("SELECT * FROM feed_state").fetchall():
+                        url = primary.get(r["feed_id"])
+                        if not url:
+                            continue
+                        last_success = r["last_success"]
+                        if last_success is None and conn.execute(
+                                "SELECT 1 FROM seeded WHERE feed_id = ? LIMIT 1", (r["feed_id"],)).fetchone():
+                            last_success = r["last_checked"] or time.time()
+                        conn.execute(
+                            "INSERT OR IGNORE INTO source_state(feed_id, url, status_code, error, redirected_to, "
+                            "redirect_code, last_checked, last_success, failures, etag, modified) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (r["feed_id"], url, r["status_code"], r["error"], r["redirected_to"], r["redirect_code"],
+                             r["last_checked"], last_success, r["failures"] or 0, r["etag"], r["modified"]))
+                        moved += 1
+                    set_meta(conn, "schema_version", DB_SCHEMA_VERSION)
+                if moved:
+                    report.append(f"database upgraded to schema 2 ({moved} feed(s) moved to per-source state)")
+            # Future schema upgrades go here: `if version < 3: ...`
 
         for line in report:
             print(f"[migrate] {line}")
@@ -704,6 +770,29 @@ def initialize():
 
 def feed_states(conn):
     return {r["feed_id"]: dict(r) for r in conn.execute("SELECT * FROM feed_state")}
+
+
+def update_source_state(conn, feed_id, url, **fields):
+    if not fields:
+        return
+    cols = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in fields)
+    conn.execute(
+        f"INSERT INTO source_state(feed_id, url, {cols}) VALUES (?, ?, {marks}) "
+        f"ON CONFLICT(feed_id, url) DO UPDATE SET {updates}",
+        (feed_id, url, *fields.values()),
+    )
+
+
+def source_states(conn, feed_id=None):
+    """{feed_id: {url: row}} for every feed, or {url: row} for one."""
+    if feed_id is not None:
+        return {r["url"]: dict(r) for r in conn.execute("SELECT * FROM source_state WHERE feed_id = ?", (feed_id,))}
+    out = {}
+    for r in conn.execute("SELECT * FROM source_state"):
+        out.setdefault(r["feed_id"], {})[r["url"]] = dict(r)
+    return out
 
 
 def update_feed_state(conn, feed_id, **fields):
@@ -753,11 +842,15 @@ def prune_state(conn, cfg):
     now = time.time()
     feed_ids = {f["id"] for f in cfg["FEEDS"]}
     pairs = {(f["id"], dest_key(h)) for f in cfg["FEEDS"] for h in f["webhooks"]}
+    sources = {(f["id"], u) for f in cfg["FEEDS"] for u in feed_urls(f)}
     live_hooks = {k for _, k in pairs}
     with transaction(conn):
         for r in conn.execute("SELECT feed_id FROM feed_state").fetchall():
             if r["feed_id"] not in feed_ids:
                 conn.execute("DELETE FROM feed_state WHERE feed_id = ?", (r["feed_id"],))
+        for r in conn.execute("SELECT feed_id, url FROM source_state").fetchall():
+            if (r["feed_id"], r["url"]) not in sources:
+                conn.execute("DELETE FROM source_state WHERE feed_id = ? AND url = ?", (r["feed_id"], r["url"]))
         for r in conn.execute("SELECT feed_id, webhook FROM seeded").fetchall():
             if (r["feed_id"], r["webhook"]) not in pairs:
                 conn.execute("DELETE FROM seeded WHERE feed_id = ? AND webhook = ?",

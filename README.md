@@ -9,8 +9,11 @@ Self-hosted RSS and Atom relay for Discord, Slack, Mattermost, Matrix, Telegram,
 
 - **Web dashboard** with live status, search, filters, drag-to-reorder (saved on the server), and light and dark themes.
 - **Multiple destinations per feed, on any mix of services.** One feed can post to any number of destinations, and one destination can receive any number of feeds. See [Destinations](#destinations).
+- **Several sources per feed.** One feed can pull from several addresses (for example four sections of the same forum) with one set of cookies, schedule and destinations. An article that appears in more than one source is posted once.
 - **Feeds behind a login.** A feed can be fetched with cookies from a signed-in browser (for example a XenForo forum) and a custom User-Agent.
-- **Edit all.** Change the check interval or pause and resume many feeds at once.
+- **Several sources.** In a feed's Source section, choose **Add another source** for each extra address. Every source uses the feed's name, cookies, User-Agent, schedule and destinations. Articles are merged, and one that appears in several sources is posted once. When a source is added to a feed that is already running, its existing articles are marked as seen, not posted; only later ones are. Each source's health is shown in the feed's details, and one failing source does not stop the others from posting.
+
+**Edit all.** Change the check interval or pause and resume many feeds at once.
 - **No backlog floods.** When a feed is first paired with a destination, everything already in the feed is marked as seen. Only articles published after that are posted. This is tracked per feed and destination pair.
 - **Reliable delivery.** An article is recorded as sent only after the destination accepts it. Rate limits are respected and retried; failed posts are retried on the next check instead of being lost.
 - **Recent deliveries log** showing what was posted where, and what failed and why.
@@ -122,7 +125,8 @@ Stop the old version, update the code, start the new one. Nothing needs converti
 
 On first start the new version:
 
-- Upgrades `config.json` to the current format (version 3). Legacy `webhook_url` and `webhook_urls` fields become `webhooks`, missing or duplicate feed ids are fixed, string values are cleaned up, and every existing destination gets a service type (Discord, or Slack for `hooks.slack.com` addresses). The original is kept as `config.json.pre-v3.bak` (earlier upgrades left a `.pre-v2.bak`).
+- Upgrades `config.json` to the current format (version 4). Legacy `webhook_url` and `webhook_urls` fields become `webhooks`, missing or duplicate feed ids are fixed, string values are cleaned up, and every existing destination gets a service type (Discord, or Slack for `hooks.slack.com` addresses). The original is kept as `config.json.pre-v4.bak` (earlier upgrades left `.pre-v3.bak` or `.pre-v2.bak`).
+- Upgrades `prss_state.db` to per-source state. Each feed's health and cache headers move to its first source, so existing feeds carry on without re-seeding.
 - Fixes `user.json` from the single-user era (missing id and role). The original is kept as `user.json.pre-v2.bak`.
 - Imports `sent_articles.yaml` and `feed_state.json` into `prss_state.db` and renames them to `*.migrated`. Destinations that had already been receiving a feed keep going without reposting anything.
 - Moves any custom feed order saved in your browser onto the server the first time you open the dashboard.
@@ -131,7 +135,7 @@ On first start the new version:
 
 **Docker users:** the volume used to be mounted over the code directory (`/usr/src/app`). It is now mounted at `/data`. The provided `docker-compose.yml` already uses the same host folder, so your existing files are found. If you changed the host path, keep your path and only change the container side to `/data`.
 
-**Rolling back** is possible: rename any `*.migrated` files back and restore the `.pre-v3.bak` (or `.pre-v2.bak`) files. An older version started without them seeds every destination again, so it does not flood channels either. Versions before destination types treat every destination as a Discord webhook, so restore the backup rather than running an older version against a config that uses other services.
+**Rolling back** is possible: rename any `*.migrated` files back and restore the newest `.pre-v*.bak` files. An older version started without them seeds every destination again, so it does not flood channels either. Versions before destination types treat every destination as a Discord webhook, so restore the backup rather than running an older version against a config that uses other services. Older versions also fetch only the first source of a feed with several.
 
 ## Using it
 
@@ -180,7 +184,7 @@ For a XenForo forum:
 
 1. Sign in with **Stay logged in** ticked, ideally in a private window.
 2. Open the browser's developer tools, then Storage (Firefox) or Application (Chrome), then Cookies, and copy `xf_user`. Adding `xf_session` does no harm.
-3. Paste as `xf_user=...; xf_session=...` and choose Preview to confirm the feed loads. Close the private window without signing out: signing out invalidates the cookie.
+3. Paste as `xf_user=...; xf_session=...` and choose Preview to confirm the feed loads. To follow several sections, add each section's RSS address as another source on the same feed so they share the cookies. Close the private window without signing out: signing out invalidates the cookie.
 
 The field also accepts one `name=value` per line, a cookies.txt export, or the JSON exported by browser cookie-editor extensions. Values are sent exactly as pasted.
 

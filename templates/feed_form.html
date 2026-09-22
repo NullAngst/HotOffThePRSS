@@ -1,6 +1,20 @@
 {% extends "base.html" %}
 {% block title %}{{ 'Add feed' if mode == 'add' else 'Edit ' ~ feed.name }}{% endblock %}
 {% block content %}
+{% macro source_row(url='') -%}
+<div class="source-row">
+  <div class="field-row">
+    <label class="field grow"><span class="js-src-label">Feed address</span>
+      <input type="url" name="url" class="js-src-url" value="{{ url }}" placeholder="https://example.com/feed.xml" spellcheck="false" autocomplete="off"></label>
+    <button type="button" class="btn js-preview">Preview</button>
+    <button type="button" class="icon-btn js-remove-source" aria-label="Remove this source" title="Remove source">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+  </div>
+  <div class="preview js-preview-box" hidden aria-live="polite"></div>
+</div>
+{%- endmacro %}
+
 {% macro hook_row(h=None) -%}
 {%- set t = h.type if h else 'discord' -%}
 {%- set meta = dest_types[t] -%}
@@ -43,12 +57,14 @@
 
     <fieldset class="panel">
       <legend>Source</legend>
-      <div class="field-row">
-        <label class="field grow"><span>Feed address</span>
-          <input type="url" name="url" id="feed-url" value="{{ feed.url }}" required placeholder="https://example.com/feed.xml" spellcheck="false" autocomplete="off"></label>
-        <button type="button" class="btn" id="preview-btn">Preview</button>
+      <div id="sources">
+        {% for u in [feed.url] + (feed.extra_urls or []) %}{{ source_row(u) }}{% endfor %}
       </div>
-      <div class="preview" id="preview" hidden aria-live="polite"></div>
+      <template id="source-template">{{ source_row() }}</template>
+      <div>
+        <button type="button" class="btn btn-quiet" id="add-source">Add another source</button>
+        <p class="hint">Several addresses can share one feed, for example the RSS feeds of four sections of the same forum. They all use this feed's name, cookies, schedule and destinations, and an article that appears in more than one of them is posted once. A newly added source's existing articles are marked as seen, not posted.</p>
+      </div>
       <label class="field"><span>Name</span>
         <input type="text" name="name" id="feed-name" value="{{ feed.name if feed.name != feed.url else '' }}" maxlength="120" placeholder="Shown with every post">
         <small>Leave empty to use the site's address. Preview fills this in from the feed's own title.</small></label>

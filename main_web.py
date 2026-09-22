@@ -364,11 +364,20 @@ def view_feeds():
     now = time.time()
     with core.db() as conn:
         states = core.feed_states(conn)
+        src_states = core.source_states(conn)
         deliveries = core.recent_deliveries(conn, 40)
         sched_state = scheduler_view(core.last_heartbeat(conn), now)
     feeds = []
     for f in cfg["FEEDS"]:
         v = feed_view(f, states.get(f["id"]), now)
+        urls = core.feed_urls(f)
+        ss = src_states.get(f["id"], {})
+        v.update(sources=[{"url": u, "error": (ss.get(u) or {}).get("error"),
+                           "failures": (ss.get(u) or {}).get("failures") or 0,
+                           "redirected_to": (ss.get(u) or {}).get("redirected_to"),
+                           "last_success": (ss.get(u) or {}).get("last_success"),
+                           "checked": bool((ss.get(u) or {}).get("last_checked"))} for u in urls],
+                 search_urls=" ".join(urls).lower())
         v.update(name=f["name"], url=f["url"], host=host_of(f["url"]), active=f["active"],
                  interval=f["update_interval"], interval_text=human_interval(f["update_interval"]),
                  cookies=bool(f.get("cookies")),
@@ -419,12 +428,23 @@ def api_reorder():
 def parse_feed_form(form):
     """Returns (fields, errors, warnings)."""
     errors, warnings = [], []
-    url = (form.get("url") or "").strip()
+    urls, seen_urls = [], set()
+    for u in form.getlist("url"):
+        u = (u or "").strip()
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        if not u.startswith(("http://", "https://")):
+            errors.append(f"Feed addresses must start with http:// or https:// ({u[:60]}).")
+            continue
+        urls.append(u)
     name = (form.get("name") or "").strip()[:MAX_NAME_LEN]
-    if not url:
+    if not urls and not errors:
         errors.append("Enter the feed address.")
-    elif not url.startswith(("http://", "https://")):
-        errors.append("The feed address must start with http:// or https://.")
+    if len(urls) > core.MAX_SOURCES:
+        errors.append(f"A feed can have at most {core.MAX_SOURCES} sources.")
+        urls = urls[:core.MAX_SOURCES]
+    url = urls[0] if urls else ""
 
     try:
         value = float(form.get("interval_value") or 0)
@@ -461,7 +481,7 @@ def parse_feed_form(form):
         errors.append("The cookies could not be read. Paste them as name=value pairs, for example xf_user=...; xf_session=...")
     user_agent = (form.get("user_agent") or "").strip()[:400]
 
-    fields = {"name": name or host_of(url), "url": url, "webhooks": hooks,
+    fields = {"name": name or host_of(url), "url": url, "extra_urls": urls[1:], "webhooks": hooks,
               "update_interval": max(interval, core.MIN_INTERVAL), "active": form.get("active") == "true",
               "cookies": cookies, "user_agent": user_agent}
     return fields, errors, warnings
@@ -512,24 +532,24 @@ def edit_feed(feed_id):
             for e in errors:
                 flash(e, "error")
             return render_feed_form({**feed, **fields}, "edit"), 400
-        url_changed = False
+        reseed = False
         with core.edit_config() as cfg:
             target = core.find_feed(cfg, feed_id)
             if target is None:
                 flash("That feed was deleted while you were editing it.", "error")
                 return redirect(url_for("view_feeds"))
-            # A different address, or different cookies (a signed-in view can
-            # show threads a guest never saw), is a different set of articles.
-            url_changed = (target["url"] != fields["url"]
-                           or (target.get("cookies") or "") != fields["cookies"])
+            # New or changed source addresses need nothing here: a source's
+            # first successful load marks its articles as seen by itself.
+            # Different cookies change what every source shows (a signed-in
+            # view has threads a guest never saw), so everything is re-seeded.
+            reseed = (target.get("cookies") or "") != fields["cookies"]
+            target.pop("extra_urls", None)
             target.update(fields)
-        if url_changed:
-            # Re-seed every destination so the new article set's backlog is
-            # not posted.
+        if reseed:
             with core.db() as conn, core.transaction(conn):
                 conn.execute("DELETE FROM seeded WHERE feed_id = ?", (feed_id,))
-                core.update_feed_state(conn, feed_id, etag=None, modified=None, redirected_to=None,
-                                       redirect_code=None)
+                conn.execute("UPDATE source_state SET etag = NULL, modified = NULL WHERE feed_id = ?", (feed_id,))
+                core.update_feed_state(conn, feed_id, redirected_to=None, redirect_code=None)
         for w in warnings:
             flash(w, "warning")
         flash(f"Saved {fields['name']}.", "success")
@@ -624,6 +644,7 @@ def delete_feed(feed_id):
     if removed:
         with core.db() as conn, core.transaction(conn):
             conn.execute("DELETE FROM feed_state WHERE feed_id = ?", (feed_id,))
+            conn.execute("DELETE FROM source_state WHERE feed_id = ?", (feed_id,))
             conn.execute("DELETE FROM seeded WHERE feed_id = ?", (feed_id,))
         flash(f"Deleted {removed['name']}.", "success")
     else:
@@ -671,19 +692,38 @@ def force_check_feed(feed_id):
 
 @app.route("/feeds/<feed_id>/adopt-redirect", methods=["POST"])
 def adopt_redirect(feed_id):
+    """Switch one source to the address it now redirects to. The form names
+    the source; without it (older pages) the first source is meant."""
+    old_url = (request.form.get("source") or "").strip()
+    feed = core.find_feed(core.load_config(), feed_id)
+    if feed is None:
+        flash("That feed no longer exists.", "error")
+        return redirect(url_for("view_feeds"))
+    old_url = old_url or feed["url"]
     with core.db() as conn:
-        row = conn.execute("SELECT redirected_to FROM feed_state WHERE feed_id = ?", (feed_id,)).fetchone()
+        row = conn.execute("SELECT redirected_to FROM source_state WHERE feed_id = ? AND url = ?",
+                           (feed_id, old_url)).fetchone()
     new_url = row["redirected_to"] if row else None
-    if not new_url:
+    if not new_url or old_url not in core.feed_urls(feed):
         flash("There is no new address to switch to.", "error")
         return redirect(url_for("view_feeds"))
     with core.edit_config() as cfg:
-        feed = core.find_feed(cfg, feed_id)
-        if feed:
-            feed["url"] = new_url
-    with core.db() as conn:
-        # Same feed at a new address: keep the seen-article memory.
-        core.update_feed_state(conn, feed_id, redirected_to=None, redirect_code=None, etag=None, modified=None)
+        target = core.find_feed(cfg, feed_id)
+        if target:
+            urls = [new_url if u == old_url else u for u in core.feed_urls(target)]
+            urls = list(dict.fromkeys(urls))           # the new address may already be a source
+            target["url"], target["extra_urls"] = urls[0], urls[1:]
+    with core.db() as conn, core.transaction(conn):
+        # Same articles at a new address: move the source's state so it is
+        # not treated as a new source, and keep the seen-article memory.
+        exists = conn.execute("SELECT 1 FROM source_state WHERE feed_id = ? AND url = ?",
+                              (feed_id, new_url)).fetchone()
+        if exists:
+            conn.execute("DELETE FROM source_state WHERE feed_id = ? AND url = ?", (feed_id, old_url))
+        else:
+            conn.execute("UPDATE source_state SET url = ?, redirected_to = NULL, redirect_code = NULL, "
+                         "etag = NULL, modified = NULL WHERE feed_id = ? AND url = ?", (new_url, feed_id, old_url))
+        core.update_feed_state(conn, feed_id, redirected_to=None, redirect_code=None)
     flash(f"Now using {new_url}.", "success")
     return redirect(url_for("view_feeds"))
 

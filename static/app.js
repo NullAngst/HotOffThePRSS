@@ -690,14 +690,44 @@
       }
     });
 
-    var previewBtn = document.getElementById("preview-btn");
-    var preview = document.getElementById("preview");
-    var urlInput = document.getElementById("feed-url");
+    var sources = document.getElementById("sources");
+    var srcTpl = document.getElementById("source-template");
     var nameInput = document.getElementById("feed-name");
-    previewBtn.addEventListener("click", function () {
+
+    function sourceRows() { return Array.prototype.slice.call(sources.querySelectorAll(".source-row")); }
+    function renumberSources() {
+      var rows = sourceRows();
+      rows.forEach(function (row, i) {
+        row.querySelector(".js-src-label").textContent = rows.length === 1 ? "Feed address" : "Source " + (i + 1);
+        row.querySelector(".js-src-url").required = i === 0;
+        row.querySelector(".js-remove-source").hidden = rows.length === 1;
+      });
+    }
+    document.getElementById("add-source").addEventListener("click", function () {
+      var node = srcTpl.content.firstElementChild.cloneNode(true);
+      sources.appendChild(node);
+      renumberSources();
+      node.querySelector(".js-src-url").focus();
+    });
+    sources.addEventListener("click", function (e) {
+      var row = e.target.closest(".source-row");
+      if (!row) return;
+      if (e.target.closest(".js-remove-source")) {
+        if (sourceRows().length > 1) row.remove();
+        renumberSources();
+        return;
+      }
+      if (e.target.closest(".js-preview")) previewSource(row);
+    });
+    renumberSources();
+
+    function previewSource(row) {
+      var urlInput = row.querySelector(".js-src-url");
+      var previewBtn = row.querySelector(".js-preview");
+      var preview = row.querySelector(".js-preview-box");
       var url = urlInput.value.trim();
       preview.hidden = false;
-      preview.className = "preview";
+      preview.className = "preview js-preview-box";
       preview.textContent = "Loading the feed...";
       previewBtn.disabled = true;
       var ck = document.getElementById("feed-cookies"), ua = document.getElementById("feed-ua");
@@ -707,7 +737,7 @@
         previewBtn.disabled = false;
         preview.textContent = "";
         if (!res.ok) {
-          preview.className = "preview bad";
+          preview.className = "preview bad js-preview-box";
           preview.textContent = res.error || "The feed could not be loaded.";
           return;
         }
@@ -730,6 +760,6 @@
         preview.appendChild(ol);
         if (!nameInput.value.trim() && res.title) nameInput.value = res.title;
       });
-    });
+    }
   }
 })();
