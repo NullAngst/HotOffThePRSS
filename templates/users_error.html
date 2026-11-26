@@ -1,0 +1,8 @@
+{% extends "auth_base.html" %}
+{% block title %}Accounts unavailable{% endblock %}
+{% block auth %}
+<h1>Accounts file unreadable</h1>
+<p>Hot Off The PRSS could not read <code>user.json</code> in its data folder, so nobody can sign in right now. Sign-up is also blocked, so nobody can take over the install while the file is damaged.</p>
+<p>To fix it, restore the newest <code>user.json.pre-*.bak</code> next to it, or repair the JSON by hand, then reload this page. Only delete <code>user.json</code> if you want to create a new Owner account from scratch.</p>
+<p class="hint">Feeds keep posting while this is broken. The details are in the container log.</p>
+{% endblock %}

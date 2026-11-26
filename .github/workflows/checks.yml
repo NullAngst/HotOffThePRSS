@@ -1,0 +1,59 @@
+# Checks only. Nothing is built or released here: the app ships as source
+# and Docker builds the image on the server.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade -r Docker/requirements.txt pytest
+
+      - name: Compile
+        run: python -m compileall -q main_web.py scheduler.py prss_core.py destinations.py
+
+      - name: Tests
+        run: python -m pytest -q tests
+
+      - name: Shellcheck
+        run: shellcheck Docker/docker_entrypoint.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build --pull -f Docker/Dockerfile -t hotofftheprss:ci .
+
+      - name: Start it and wait for the health check
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          docker run -d --name prss --init -p 5000:5000 -v "$RUNNER_TEMP/data:/data" hotofftheprss:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5000/healthz; then
+              printf '\nhealthy\n'
+              docker stop prss
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs prss
+          exit 1
