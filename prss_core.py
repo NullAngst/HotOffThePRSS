@@ -28,21 +28,31 @@ import contextlib
 import destinations as dest
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.abspath(os.environ.get("PRSS_DATA_DIR") or SCRIPT_DIR)
 
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-USER_FILE = os.path.join(DATA_DIR, "user.json")
-SECRET_KEY_FILE = os.path.join(DATA_DIR, "secret.key")
-DB_FILE = os.path.join(DATA_DIR, "prss_state.db")
-LEGACY_SENT_FILE = os.path.join(DATA_DIR, "sent_articles.yaml")
-LEGACY_STATE_FILE = os.path.join(DATA_DIR, "feed_state.json")
+
+def set_data_dir(path):
+    """Point every data file at `path`. Called once at import; tests call it
+    again to work in a throwaway directory."""
+    global DATA_DIR, CONFIG_FILE, USER_FILE, SECRET_KEY_FILE, DB_FILE
+    global LEGACY_SENT_FILE, LEGACY_STATE_FILE
+    DATA_DIR = os.path.abspath(path)
+    CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+    USER_FILE = os.path.join(DATA_DIR, "user.json")
+    SECRET_KEY_FILE = os.path.join(DATA_DIR, "secret.key")
+    DB_FILE = os.path.join(DATA_DIR, "prss_state.db")
+    LEGACY_SENT_FILE = os.path.join(DATA_DIR, "sent_articles.yaml")
+    LEGACY_STATE_FILE = os.path.join(DATA_DIR, "feed_state.json")
+
+
+set_data_dir(os.environ.get("PRSS_DATA_DIR") or SCRIPT_DIR)
 
 # 2: normalized ids and webhooks.  3: destination types (Discord, Slack,
 # Matrix, ...), per-feed cookies and User-Agent.  4: extra source addresses
 # per feed ("extra_urls").
 CONFIG_VERSION = 4
 # 1: initial SQLite layout.  2: per-source state (source_state).
-DB_SCHEMA_VERSION = 2
+# 3: source_state.last_parsed (time of the last full download and parse).
+DB_SCHEMA_VERSION = 3
 MAX_SOURCES = 20
 
 MIN_INTERVAL = 30
@@ -104,6 +114,20 @@ def file_lock(name):
             yield
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def scheduler_lock():
+    """Hold this for as long as a scheduler runs. Returns an open file, or
+    None when another scheduler already holds it. Two schedulers on one data
+    directory would each decide the same article is new and both post it."""
+    ensure_data_dir()
+    f = open(os.path.join(DATA_DIR, ".scheduler.lock"), "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
 
 
 def backup_copy(path, tag):
@@ -289,9 +313,11 @@ def save_config(cfg):
 @contextlib.contextmanager
 def edit_config():
     """Read-modify-write the config under a lock. Yields the config dict;
-    it is saved when the block exits without an exception."""
+    it is saved when the block exits without an exception. Raises ConfigError
+    if the file can not be read, so a damaged file is never overwritten with
+    whatever this one edit contains."""
     with file_lock("config"):
-        cfg = load_config()
+        cfg = load_config(strict=True)
         yield cfg
         save_config(cfg)
 
@@ -402,7 +428,16 @@ def normalize_users(data):
     return users, changed
 
 
-def load_users():
+class UsersError(Exception):
+    pass
+
+
+def load_users(strict=False):
+    """Load user.json. A missing or empty file means no accounts yet.
+
+    With strict=True an unreadable file raises UsersError. The web UI uses
+    that to refuse first-time setup: treating a damaged file as "no users"
+    would let anyone who reaches the page create a new Owner over it."""
     try:
         with open(USER_FILE, "r", encoding="utf-8") as f:
             content = f.read()
@@ -410,6 +445,8 @@ def load_users():
     except FileNotFoundError:
         return []
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        if strict:
+            raise UsersError(str(e))
         print(f"Warning: user.json unreadable ({e}).")
         return []
     users, _ = normalize_users(raw)
@@ -424,7 +461,7 @@ def save_users(users):
 @contextlib.contextmanager
 def edit_users():
     with file_lock("users"):
-        users = load_users()
+        users = load_users(strict=True)
         yield users
         save_users(users)
 
@@ -516,6 +553,7 @@ CREATE TABLE IF NOT EXISTS source_state (
     failures      INTEGER NOT NULL DEFAULT 0,
     etag          TEXT,
     modified      TEXT,
+    last_parsed   REAL,
     PRIMARY KEY (feed_id, url)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS deliveries (
@@ -756,10 +794,22 @@ def initialize():
                             (r["feed_id"], url, r["status_code"], r["error"], r["redirected_to"], r["redirect_code"],
                              r["last_checked"], last_success, r["failures"] or 0, r["etag"], r["modified"]))
                         moved += 1
-                    set_meta(conn, "schema_version", DB_SCHEMA_VERSION)
+                    set_meta(conn, "schema_version", 2)
                 if moved:
                     report.append(f"database upgraded to schema 2 ({moved} feed(s) moved to per-source state)")
-            # Future schema upgrades go here: `if version < 3: ...`
+            if version < 3:
+                # last_parsed starts at the last success, the closest value
+                # earlier versions kept. A source that has not worked for a
+                # month is then re-seeded instead of reposting old articles.
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(source_state)")}
+                with transaction(conn):
+                    if "last_parsed" not in cols:
+                        conn.execute("ALTER TABLE source_state ADD COLUMN last_parsed REAL")
+                    conn.execute("UPDATE source_state SET last_parsed = last_success WHERE last_parsed IS NULL")
+                    set_meta(conn, "schema_version", 3)
+                if version >= 1:
+                    report.append("database upgraded to schema 3 (per-source download time)")
+            # Future schema upgrades go here: `if version < 4: ...`
 
         for line in report:
             print(f"[migrate] {line}")

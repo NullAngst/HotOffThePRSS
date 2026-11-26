@@ -3,19 +3,30 @@ services:
     build:
       context: ..
       dockerfile: Docker/Dockerfile
+      # Fresh base image and packages on every deploy, so nothing goes stale.
+      pull: true
+      no_cache: true
     image: hotofftheprss:latest
     container_name: hotofftheprss
+    # Small init process as PID 1: forwards docker stop to the app and reaps
+    # exited processes.
+    init: true
+    # Time for in-flight posts to finish before the container is killed.
+    stop_grace_period: 30s
     ports:
       - 5000:5000
     restart: unless-stopped
     environment:
       - PRSS_DATA_DIR=/data
+      # The app runs as this user and group. The data folder is handed to
+      # them on start. Match your host user (id -u, id -g) to edit the files
+      # without sudo. Set PUID=0 to keep running as root.
+      - PUID=1000
+      - PGID=1000
       # Set to 1 when serving over HTTPS so the session cookie is marked Secure.
       - PRSS_SECURE_COOKIES=0
       # Set to 1 only when running behind your own reverse proxy.
       - PRSS_TRUST_PROXY=0
     volumes:
-      # Same host folder as before. It used to be mounted over the code
-      # directory; it now only holds data (config.json, user.json, secret.key,
-      # prss_state.db). Existing files in it are picked up and migrated.
+      # Holds config.json, user.json, secret.key and prss_state.db.
       - /data/compose/hotofftheprss:/data

@@ -11,17 +11,18 @@
 # from config.json when empty, so a Discord destination looks exactly like it
 # did in earlier versions apart from the added "type".
 
+import os
 import html
 import time
 import uuid
 import hashlib
 import threading
+from typing import NamedTuple
 from datetime import datetime, timezone
 from urllib.parse import urlparse, quote
 
-import os
-
 import requests
+import urllib3
 
 USER_AGENT = "HotOffThePRSS (self-hosted RSS relay)"
 HTTP_TIMEOUT = 15
@@ -32,6 +33,23 @@ EMBED_COLOR = 0x58B9FF
 TELEGRAM_API = os.environ.get("PRSS_TELEGRAM_API", "https://api.telegram.org").rstrip("/")
 
 DISCORD_HOSTS = {"discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"}
+
+# Services that drop a repeated send of the same message on their own. Only
+# these are retried after a request that got no answer.
+IDEMPOTENT = {"matrix"}
+
+
+class Result(NamedTuple):
+    """Outcome of one delivery.
+
+    permanent: the service rejected this content; retrying the same message
+    can never work, so the article is marked as handled.
+    uncertain: the request went out but no answer came back, so the post may
+    have gone through."""
+    ok: bool
+    message: str
+    permanent: bool = False
+    uncertain: bool = False
 
 # UI metadata. "fields" lists which of url/target/token the type uses, with the
 # label, placeholder and whether it is required. The form and the validator
@@ -301,67 +319,115 @@ def _retry_after(r):
         return 2.0
 
 
-def _request(method, url, config_errors=(), **kw):
-    """Send with rate-limit handling. Returns (ok, message, permanent).
+_NOT_SENT = (urllib3.exceptions.NewConnectionError, urllib3.exceptions.ConnectTimeoutError,
+             urllib3.exceptions.ProxyError, requests.exceptions.ProxyError,
+             requests.exceptions.SSLError, requests.exceptions.InvalidURL)
 
-    `permanent` means retrying this exact message will never succeed because
-    the service rejected its content, so the article is marked as handled.
+
+def _never_sent(exc):
+    """True when the error happened before the request left this machine
+    (DNS, refused connection, TLS handshake). A reset or a missing reply after
+    that point means the service may have accepted the post."""
+    stack, seen = [exc], set()
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        if isinstance(e, _NOT_SENT):
+            return True
+        stack.extend((getattr(e, "reason", None), e.__cause__, e.__context__))
+        stack.extend(a for a in getattr(e, "args", ()) if isinstance(a, BaseException))
+    return False
+
+
+def _request(method, url, config_errors=(), quick=False, **kw):
+    """Send with rate-limit handling. Returns a Result.
+
     Address, permission and token problems are not permanent: the article
     stays queued and is retried once the destination is fixed.
     `config_errors` lists phrases in an error reply that mean a setup problem
     even when the status code would otherwise count as a content rejection.
+    `quick` limits waiting for rate limits, for the web UI's Send test, which
+    has to answer within the web request's timeout.
     """
     headers = {"User-Agent": USER_AGENT, **kw.pop("headers", {})}
-    for _ in range(MAX_RATE_LIMIT_RETRIES):
+    attempts, max_wait = (2, 5) if quick else (MAX_RATE_LIMIT_RETRIES, 30)
+    for _ in range(attempts):
         try:
-            r = requests.request(method, url, headers=headers, timeout=HTTP_TIMEOUT, **kw)
+            r = requests.request(method, url, headers=headers, timeout=(10, HTTP_TIMEOUT), **kw)
+        except requests.exceptions.ConnectTimeout:
+            return Result(False, "Could not connect to the service in time")
         except requests.Timeout:
-            return False, "The service did not respond in time", False
-        except requests.RequestException:
-            return False, "Could not reach the service", False
+            return Result(False, "The service took too long to answer", uncertain=True)
+        except requests.RequestException as e:
+            if _never_sent(e):
+                return Result(False, "Could not reach the service")
+            return Result(False, "The connection dropped before the service answered", uncertain=True)
         if 200 <= r.status_code < 300:
             if r.headers.get("X-RateLimit-Remaining") == "0":
                 try:
                     time.sleep(min(float(r.headers.get("X-RateLimit-Reset-After", "1")), 10))
                 except ValueError:
                     time.sleep(1)
-            return True, "Sent", False
+            return Result(True, "Sent")
         if r.status_code == 429:
-            time.sleep(min(max(_retry_after(r), 0.5), 30))
+            time.sleep(min(max(_retry_after(r), 0.5), max_wait))
             continue
         detail = _error_detail(r)
         if r.status_code in (401, 403, 404, 410):
-            return False, f"Rejected ({r.status_code}) {detail}".strip() + "; check the address and token", False
+            return Result(False, f"Rejected ({r.status_code}) {detail}".strip() + "; check the address and token")
         if 400 <= r.status_code < 500:
             if any(p in detail.lower() for p in config_errors):
-                return False, f"Rejected ({r.status_code}) {detail}".strip(), False
-            return False, f"Refused the post ({r.status_code}) {detail}".strip(), True
-        return False, f"Server error ({r.status_code})", False
-    return False, "Still rate limited after retries", False
+                return Result(False, f"Rejected ({r.status_code}) {detail}".strip())
+            return Result(False, f"Refused the post ({r.status_code}) {detail}".strip(), permanent=True)
+        # A gateway timeout means a proxy gave up waiting for the service,
+        # which may still have processed the post.
+        return Result(False, f"Server error ({r.status_code})", uncertain=r.status_code == 504)
+    return Result(False, "Still rate limited after retries")
 
 
 # --- Senders ------------------------------------------------------------------------
 
-def _send_discord(d, a):
+def _send_discord(d, a, quick=False):
     payload = {"allowed_mentions": {"parse": []}, "embeds": [discord_embed(a)]}
-    return _request("POST", d["url"], json=payload)
+    res = _request("POST", d["url"], json=payload, quick=quick)
+    if res.ok or not res.permanent:
+        return res
+    # Discord rejects the whole message when one embed field is invalid (an
+    # unusual image address, an over-long link). Fall back to plainer forms
+    # rather than dropping the article.
+    text = a["title"] + (f"\n{a['link']}" if a.get("link") else "")
+    plain = {"title": a["title"][:256] or "Untitled article", "color": EMBED_COLOR,
+             "description": ((a.get("summary") or "") + ("\n\n" + a["link"] if a.get("link") else ""))[:4096] or None,
+             "footer": {"text": (a["feed_name"] or "RSS")[:2048]}}
+    for fallback in ({"allowed_mentions": {"parse": []}, "embeds": [{k: v for k, v in plain.items() if v}]},
+                     {"allowed_mentions": {"parse": []}, "content": text[:2000]}):
+        retry = _request("POST", d["url"], json=fallback, quick=quick)
+        if retry.ok or not retry.permanent:
+            return retry
+    return res
 
 
-def _send_slack(d, a):
+def _slack_url(url):
+    return url.replace("|", "%7C").replace("<", "%3C").replace(">", "%3E")
+
+
+def _send_slack(d, a, quick=False):
     title = _slack_escape(a["title"]).replace("|", "\u2223")
-    head = f"*<{a['link']}|{title}>*" if a.get("link") else f"*{title}*"
+    head = f"*<{_slack_url(a['link'])}|{title}>*" if a.get("link") else f"*{title}*"
     body = head + (f"\n{_slack_escape(a['summary'])}" if a.get("summary") else "")
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": body[:3000]}}]
     if a.get("image"):
         blocks[0]["accessory"] = {"type": "image", "image_url": a["image"], "alt_text": "thumbnail"}
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": _slack_escape(a["feed_name"])[:300]}]})
     fallback = a["title"] + (f" {a['link']}" if a.get("link") else "")
-    return _request("POST", d["url"], json={"text": fallback, "blocks": blocks},
+    return _request("POST", d["url"], json={"text": fallback, "blocks": blocks}, quick=quick,
                     config_errors=("no_service", "channel_not_found", "invalid_token", "no_team"))
 
 
-def _send_mattermost(d, a):
-    return _request("POST", d["url"], json={"text": _markdown(a)})
+def _send_mattermost(d, a, quick=False):
+    return _request("POST", d["url"], json={"text": _markdown(a)}, quick=quick)
 
 
 _matrix_rooms = {}
@@ -385,7 +451,10 @@ def _matrix_room_id(d):
         return None, "Could not reach the homeserver"
     if r.status_code != 200:
         return None, f"Could not resolve room alias {room} ({r.status_code}) {_error_detail(r)}".strip()
-    rid = (r.json() or {}).get("room_id")
+    try:
+        rid = (r.json() or {}).get("room_id")
+    except (ValueError, AttributeError):
+        rid = None
     if not rid:
         return None, f"Could not resolve room alias {room}"
     with _matrix_lock:
@@ -393,27 +462,40 @@ def _matrix_room_id(d):
     return rid, None
 
 
-def _send_matrix(d, a):
+def _send_matrix(d, a, quick=False):
     rid, err = _matrix_room_id(d)
     if err:
-        return False, err, False
+        return Result(False, err)
+    # The transaction id is fixed per (destination, article), so the
+    # homeserver drops a repeat of a send whose answer was lost.
+    txn = a.get("uid") or uuid.uuid4().hex
     url = (f"{d['url'].rstrip('/')}/_matrix/client/v3/rooms/{quote(rid, safe='')}"
-           f"/send/m.room.message/prss{uuid.uuid4().hex}")
+           f"/send/m.room.message/prss{txn}")
     content = {"msgtype": "m.notice", "body": _plain(a),
                "format": "org.matrix.custom.html", "formatted_body": "<br>".join(_html_message(a))}
-    return _request("PUT", url, json=content, headers={"Authorization": f"Bearer {d['token']}"})
+    return _request("PUT", url, json=content, headers={"Authorization": f"Bearer {d['token']}"}, quick=quick)
 
 
-def _send_telegram(d, a):
+TELEGRAM_MAX = 4096
+
+
+def _send_telegram(d, a, quick=False):
     url = f"{TELEGRAM_API}/bot{d['token']}/sendMessage"
-    text = "\n".join(_html_message(a))[:4096]
+    # Cutting HTML mid-tag makes Telegram reject the whole message, so
+    # shorten by dropping parts instead.
+    text = "\n".join(_html_message(a))
     payload = {"chat_id": d["target"], "text": text, "parse_mode": "HTML"}
-    return _request("POST", url, json=payload,
+    if len(text) > TELEGRAM_MAX:
+        text = "\n".join(_html_message({**a, "summary": ""}))
+        payload["text"] = text
+    if len(text) > TELEGRAM_MAX:
+        payload = {"chat_id": d["target"], "text": _plain(a)[:TELEGRAM_MAX]}
+    return _request("POST", url, json=payload, quick=quick,
                     config_errors=("chat not found", "not enough rights", "bot was kicked",
                                    "not a member", "have no rights", "group chat was upgraded"))
 
 
-def _send_ntfy(d, a):
+def _send_ntfy(d, a, quick=False):
     p = urlparse(d["url"])
     topic = [x for x in p.path.split("/") if x][0]
     payload = {"topic": topic, "title": a["title"][:250], "message": a.get("summary") or a["feed_name"],
@@ -422,10 +504,10 @@ def _send_ntfy(d, a):
         payload["click"] = a["link"]
         payload["actions"] = [{"action": "view", "label": "Open", "url": a["link"]}]
     headers = {"Authorization": f"Bearer {d['token']}"} if d.get("token") else {}
-    return _request("POST", f"{p.scheme}://{p.netloc}", json=payload, headers=headers)
+    return _request("POST", f"{p.scheme}://{p.netloc}", json=payload, headers=headers, quick=quick)
 
 
-def _send_gotify(d, a):
+def _send_gotify(d, a, quick=False):
     msg = a.get("summary") or ""
     if a.get("link"):
         msg = (msg + "\n\n" if msg else "") + a["link"]
@@ -434,14 +516,14 @@ def _send_gotify(d, a):
     if a.get("link"):
         payload["extras"]["client::notification"] = {"click": {"url": a["link"]}}
     return _request("POST", f"{d['url'].rstrip('/')}/message", json=payload,
-                    headers={"X-Gotify-Key": d["token"]})
+                    headers={"X-Gotify-Key": d["token"]}, quick=quick)
 
 
-def _send_webhook(d, a):
+def _send_webhook(d, a, quick=False):
     payload = {"feed": a["feed_name"], "title": a["title"], "link": a.get("link"),
                "summary": a.get("summary"), "published": _iso(a.get("published")),
                "image": a.get("image")}
-    return _request("POST", d["url"], json=payload)
+    return _request("POST", d["url"], json=payload, quick=quick)
 
 
 _SENDERS = {
@@ -451,12 +533,15 @@ _SENDERS = {
 }
 
 
-def send(d, article):
-    """Deliver one article. Returns (ok, message, permanent)."""
+def send(d, article, quick=False):
+    """Deliver one article. Returns a Result."""
     sender = _SENDERS.get(d.get("type"))
     if sender is None:
-        return False, f"Unknown destination type {d.get('type')!r}", False
-    return sender(d, article)
+        return Result(False, f"Unknown destination type {d.get('type')!r}")
+    try:
+        return sender(d, article, quick=quick)
+    except Exception as e:                 # a formatting bug must not kill the check
+        return Result(False, f"Could not build the message ({type(e).__name__})")
 
 
 def test_article(label, username):
@@ -464,4 +549,4 @@ def test_article(label, username):
             "link": None,
             "summary": f"New articles for {label[:80]} will appear here.",
             "published": time.time(), "image": None,
-            "feed_name": f"Test sent by {username}"}
+            "feed_name": f"Test sent by {username}", "uid": None}

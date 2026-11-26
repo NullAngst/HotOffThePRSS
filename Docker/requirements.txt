@@ -1,6 +1,8 @@
-feedparser>=6.0
-PyYAML>=6.0
-Flask>=3.0
-gunicorn>=22.0
-requests>=2.31
-werkzeug>=3.0
+# Lower bounds only: every build installs the newest release of each.
+feedparser>=6.0.11
+PyYAML>=6.0.2
+Flask>=3.1
+gunicorn>=23.0
+requests>=2.32.3
+urllib3>=2.2
+werkzeug>=3.1

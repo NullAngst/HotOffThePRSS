@@ -2,15 +2,17 @@
 # Web dashboard. Serve with: gunicorn --bind 0.0.0.0:5000 main_web:app
 
 import os
+import io
 import sys
-import logging
-import time
-import uuid
 import hmac
 import json
+import time
+import uuid
+import hashlib
+import logging
 import secrets
 from datetime import timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from flask import (Flask, render_template, request, redirect, url_for, flash,
                    send_file, session, g, jsonify, abort)
@@ -32,8 +34,10 @@ MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 256
 MAX_USERNAME_LEN = 64
 MAX_NAME_LEN = 120
-LOGIN_FREE_ATTEMPTS = 5
+LOGIN_FREE_ATTEMPTS = 5          # per address and username
+LOGIN_FREE_ATTEMPTS_IP = 20     # per address, across every username
 SCHEDULER_STALE_AFTER = 45
+INTERVAL_UNITS = {"seconds": 1, "minutes": 60, "hours": 3600}
 
 core.initialize()
 
@@ -57,6 +61,19 @@ if os.environ.get("PRSS_TRUST_PROXY") == "1":
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
+
+
+def _asset_version():
+    """Changes whenever a static file changes, so browsers fetch the new
+    CSS and JS after an update instead of serving a cached copy."""
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(app.static_folder)):
+        with open(os.path.join(app.static_folder, name), "rb") as f:
+            h.update(name.encode() + f.read())
+    return h.hexdigest()[:10]
+
+
+ASSET_VERSION = _asset_version()
 
 
 # --- Helpers ----------------------------------------------------------------------
@@ -105,6 +122,35 @@ def validate_username(name, users, exclude_id=None):
     return None
 
 
+def safe_next(target):
+    """Only same-site paths. "//host" and "/\\host" are read by browsers as
+    another site, and anything with a scheme or host is rejected outright."""
+    target = target or ""
+    if not target.startswith("/") or target.startswith(("//", "/\\")) or "\\" in target:
+        return None
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc or any(ord(c) < 32 for c in target):
+        return None
+    return target
+
+
+def same_site_referrer():
+    ref = request.referrer or ""
+    parts = urlsplit(ref)
+    if parts.netloc and parts.netloc == request.host:
+        return safe_next(parts.path + (f"?{parts.query}" if parts.query else ""))
+    return None
+
+
+def parse_interval(form):
+    """Seconds from the interval fields, or 0 when the input is unusable."""
+    try:
+        value = float(form.get("interval_value") or 0)
+        return int(value * INTERVAL_UNITS.get(form.get("interval_unit"), 60))
+    except (TypeError, ValueError, OverflowError):     # "nan", "inf"
+        return 0
+
+
 def host_of(url):
     try:
         return urlparse(url).hostname or url
@@ -148,6 +194,7 @@ def feed_view(feed, st, now):
     last_checked = st.get("last_checked")
     return {
         "id": feed["id"],
+        "active": feed["active"],
         "status": status,
         "label": label,
         "attention": attention,
@@ -203,8 +250,17 @@ PUBLIC_ENDPOINTS = {"login", "setup", "static", "healthz"}
 
 @app.before_request
 def load_user():
-    g.users = core.load_users()
-    g.user = None
+    g.users, g.user, g.users_error = [], None, None
+    if request.endpoint in ("static", "healthz"):
+        return None
+    try:
+        g.users = core.load_users(strict=True)
+    except core.UsersError as e:
+        # Never fall back to "no users": that would open first-time setup to
+        # anyone and let them write a new Owner over the damaged file.
+        g.users_error = str(e)
+        log.error("user.json is unreadable (%s); sign-in is disabled until it is fixed", e)
+        return render_template("users_error.html"), 503
     uid = session.get("user_id")
     if uid:
         user = next((u for u in g.users if u["id"] == uid), None)
@@ -227,7 +283,7 @@ def csrf_protect():
             log.warning("Rejected %s %s: missing or stale CSRF token", request.method, request.path)
             return jsonify(ok=False, error="Your session expired. Reload the page."), 400
         flash("That form expired. Try again.", "error")
-        return redirect(request.referrer or url_for("view_feeds"))
+        return redirect(same_site_referrer() or url_for("view_feeds"))
     return None
 
 
@@ -248,7 +304,8 @@ def require_login():
 def inject_globals():
     if "csrf" not in session:
         session["csrf"] = secrets.token_urlsafe(32)
-    return {"csrf_token": session["csrf"], "rank": rank, "can_manage": can_manage}
+    return {"csrf_token": session["csrf"], "rank": rank, "can_manage": can_manage,
+            "asset_version": ASSET_VERSION}
 
 
 @app.after_request
@@ -265,16 +322,23 @@ def security_headers(resp):
 
 # --- Auth ------------------------------------------------------------------------
 
-def _throttle_key(username):
-    return f"{request.remote_addr}|{username.casefold()}"
+def _throttle_keys(username):
+    """(key, free attempts) pairs. The per-address key stops one client
+    from trying a password against every username in turn."""
+    addr = request.remote_addr or "?"
+    return ((f"{addr}|{username.casefold()}", LOGIN_FREE_ATTEMPTS),
+            (f"ip:{addr}", LOGIN_FREE_ATTEMPTS_IP))
 
 
-def _login_wait(conn, key):
-    row = conn.execute("SELECT count, last FROM login_failures WHERE key = ?", (key,)).fetchone()
-    if not row or row["count"] < LOGIN_FREE_ATTEMPTS:
-        return 0
-    delay = min(15 * 2 ** (row["count"] - LOGIN_FREE_ATTEMPTS), 900)
-    return max(0, int(row["last"] + delay - time.time()))
+def _login_wait(conn, keys):
+    wait = 0
+    for key, free in keys:
+        row = conn.execute("SELECT count, last FROM login_failures WHERE key = ?", (key,)).fetchone()
+        if not row or row["count"] < free:
+            continue
+        delay = min(15 * 2 ** min(row["count"] - free, 10), 900)
+        wait = max(wait, int(row["last"] + delay - time.time()))
+    return wait
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -311,9 +375,9 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
-        key = _throttle_key(username)
+        keys = _throttle_keys(username)
         with core.db() as conn:
-            wait = _login_wait(conn, key)
+            wait = _login_wait(conn, keys)
             if wait:
                 flash(f"Too many failed attempts. Try again in {wait} seconds.", "error")
                 return render_template("login.html", username=username), 429
@@ -325,21 +389,34 @@ def login():
             # whether the username exists.
             ok = check_password_hash(user["password"] if user else _DUMMY_HASH, password) and user
             if ok:
-                conn.execute("DELETE FROM login_failures WHERE key = ?", (key,))
+                conn.execute("DELETE FROM login_failures WHERE key = ?", (keys[0][0],))
+                _upgrade_hash(user, password)
                 session.clear()
                 session.permanent = True
                 session["user_id"] = user["id"]
                 session["epoch"] = user["session_epoch"]
-                nxt = request.args.get("next") or ""
-                if not nxt.startswith("/") or nxt.startswith("//"):
-                    nxt = url_for("view_feeds")
-                return redirect(nxt)
-            conn.execute(
+                return redirect(safe_next(request.args.get("next")) or url_for("view_feeds"))
+            conn.executemany(
                 "INSERT INTO login_failures(key, count, last) VALUES (?, 1, ?) "
                 "ON CONFLICT(key) DO UPDATE SET count = count + 1, last = excluded.last",
-                (key, time.time()))
+                [(k, time.time()) for k, _ in keys])
         flash("Wrong username or password.", "error")
     return render_template("login.html", username=username)
+
+
+def _upgrade_hash(user, password):
+    """Re-hash passwords stored with an older default method (pbkdf2 from
+    early versions) using Werkzeug's current default, once, at sign-in."""
+    current = generate_password_hash("x").split(":", 1)[0]
+    if user["password"].split(":", 1)[0] == current:
+        return
+    try:
+        with core.edit_users() as users:
+            for u in users:
+                if u["id"] == user["id"] and u["password"] == user["password"]:
+                    u["password"] = generate_password_hash(password)
+    except Exception as e:                     # never block a sign-in over this
+        log.warning("Could not upgrade the password hash for %s: %s", user["username"], e)
 
 
 @app.route("/logout", methods=["POST"])
@@ -351,16 +428,39 @@ def logout():
 
 @app.route("/healthz")
 def healthz():
-    with core.db() as conn:
-        s = scheduler_view(core.last_heartbeat(conn), time.time())
-    return jsonify(ok=True, scheduler=s["state"]), 200
+    """200 while the web UI and the scheduler both work, 503 otherwise."""
+    try:
+        with core.db() as conn:
+            s = scheduler_view(core.last_heartbeat(conn), time.time())
+    except Exception:
+        return jsonify(ok=False, scheduler="unknown"), 503
+    up = s["state"] == "up"
+    return jsonify(ok=up, scheduler=s["state"]), 200 if up else 503
 
 
 # --- Dashboard ----------------------------------------------------------------------
 
+def load_config_or_flash():
+    try:
+        return core.load_config(strict=True)
+    except core.ConfigError as e:
+        flash(f"config.json can not be read ({e}). Feeds can not be changed until it is fixed "
+              "or a backup is restored.", "error")
+        return {"FEEDS": []}
+
+
+@app.errorhandler(core.ConfigError)
+def config_error(e):
+    msg = f"config.json can not be read ({e}). Nothing was changed. Fix the file or restore a backup."
+    if wants_json():
+        return jsonify(ok=False, error=msg), 503
+    flash(msg, "error")
+    return redirect(url_for("backup_restore") if g.user and rank(g.user["role"]) >= 2 else url_for("view_feeds"))
+
+
 @app.route("/")
 def view_feeds():
-    cfg = core.load_config()
+    cfg = load_config_or_flash()
     now = time.time()
     with core.db() as conn:
         states = core.feed_states(conn)
@@ -396,7 +496,7 @@ def view_feeds():
 
 @app.route("/api/status")
 def api_status():
-    cfg = core.load_config()
+    cfg = core.load_config(strict=True)
     now = time.time()
     with core.db() as conn:
         states = core.feed_states(conn)
@@ -446,12 +546,7 @@ def parse_feed_form(form):
         urls = urls[:core.MAX_SOURCES]
     url = urls[0] if urls else ""
 
-    try:
-        value = float(form.get("interval_value") or 0)
-        unit = {"seconds": 1, "minutes": 60, "hours": 3600}.get(form.get("interval_unit"), 60)
-        interval = int(value * unit)
-    except (TypeError, ValueError):
-        interval = 0
+    interval = parse_interval(form)
     if interval < core.MIN_INTERVAL:
         errors.append(f"Check at most every {core.MIN_INTERVAL} seconds.")
     elif interval > core.MAX_INTERVAL:
@@ -522,7 +617,7 @@ def add_feed():
 
 @app.route("/edit/<feed_id>", methods=["GET", "POST"])
 def edit_feed(feed_id):
-    feed = core.find_feed(core.load_config(), feed_id)
+    feed = core.find_feed(core.load_config(strict=True), feed_id)
     if feed is None:
         flash("That feed no longer exists.", "error")
         return redirect(url_for("view_feeds"))
@@ -560,7 +655,7 @@ def edit_feed(feed_id):
 @app.route("/feeds/bulk", methods=["GET", "POST"])
 def bulk_edit():
     """Change the check interval and/or active state of many feeds at once."""
-    cfg = core.load_config()
+    cfg = core.load_config(strict=True)
     if not cfg["FEEDS"]:
         flash("There are no feeds to edit yet.", "warning")
         return redirect(url_for("view_feeds"))
@@ -574,12 +669,7 @@ def bulk_edit():
             errors.append("Select at least one feed.")
         interval = None
         if change_interval:
-            try:
-                value = float(form.get("interval_value") or 0)
-                unit = {"seconds": 1, "minutes": 60, "hours": 3600}.get(form.get("interval_unit"), 60)
-                interval = int(value * unit)
-            except (TypeError, ValueError):
-                interval = 0
+            interval = parse_interval(form)
             if interval < core.MIN_INTERVAL:
                 errors.append(f"Check at most every {core.MIN_INTERVAL} seconds.")
             elif interval > core.MAX_INTERVAL:
@@ -674,7 +764,7 @@ def force_check_feed(feed_id):
     """Queues a check for the scheduler instead of running it inside the web
     request. Running it here (as before) could time out the gunicorn worker
     and raced with the scheduler checking the same feed."""
-    feed = core.find_feed(core.load_config(), feed_id)
+    feed = core.find_feed(core.load_config(strict=True), feed_id)
     if not feed:
         if wants_json():
             return jsonify(ok=False, error="Feed not found"), 404
@@ -695,7 +785,7 @@ def adopt_redirect(feed_id):
     """Switch one source to the address it now redirects to. The form names
     the source; without it (older pages) the first source is meant."""
     old_url = (request.form.get("source") or "").strip()
-    feed = core.find_feed(core.load_config(), feed_id)
+    feed = core.find_feed(core.load_config(strict=True), feed_id)
     if feed is None:
         flash("That feed no longer exists.", "error")
         return redirect(url_for("view_feeds"))
@@ -752,13 +842,13 @@ def api_test_webhook():
     if errors:
         return jsonify(ok=False, error=" ".join(errors))
     label = d["label"] or "this channel"
-    ok, msg, _ = dest.send(d, dest.test_article(label, g.user["username"]))
+    res = dest.send(d, dest.test_article(label, g.user["username"]), quick=True)
     name = dest.TYPES[d["type"]]["name"]
-    if ok:
+    if res.ok:
         log.info("Test %s to %s sent by %s", name, dest.describe(d), g.user["username"])
     else:
-        log.warning("Test %s to %s failed: %s", name, dest.describe(d), msg)
-    return jsonify(ok=ok, error=None if ok else msg)
+        log.warning("Test %s to %s failed: %s", name, dest.describe(d), res.message)
+    return jsonify(ok=res.ok, error=None if res.ok else res.message)
 
 
 # --- Settings and users --------------------------------------------------------------
@@ -922,7 +1012,7 @@ def backup_restore():
     denied = require_role("super_admin")
     if denied:
         return denied
-    cfg = core.load_config()
+    cfg = load_config_or_flash()
     return render_template("backup.html", feed_count=len(cfg["FEEDS"]),
                            hook_count=sum(len(f["webhooks"]) for f in cfg["FEEDS"]),
                            user_count=len(g.users))
@@ -934,9 +1024,8 @@ def download_backup():
     if denied:
         return denied
     with core.file_lock("config"):
-        data = json.dumps(core.load_config(), indent=4).encode("utf-8")
-    from io import BytesIO
-    return send_file(BytesIO(data), as_attachment=True, download_name="config.json",
+        data = json.dumps(core.load_config(strict=True), indent=4).encode("utf-8")
+    return send_file(io.BytesIO(data), as_attachment=True, download_name="config.json",
                      mimetype="application/json")
 
 
@@ -945,9 +1034,8 @@ def download_users_backup():
     denied = require_role("owner")
     if denied:
         return denied
-    from io import BytesIO
-    data = json.dumps(core.load_users(), indent=2).encode("utf-8")
-    return send_file(BytesIO(data), as_attachment=True, download_name="user.json",
+    data = json.dumps(core.load_users(strict=True), indent=2).encode("utf-8")
+    return send_file(io.BytesIO(data), as_attachment=True, download_name="user.json",
                      mimetype="application/json")
 
 

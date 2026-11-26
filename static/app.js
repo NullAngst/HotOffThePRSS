@@ -324,6 +324,7 @@
       var feed = list && list.querySelector('.feed[data-id="' + v.id + '"]');
       if (!feed) return;
       setStatus(feed, v.status, v.label);
+      if (typeof v.active === "boolean") feed.dataset.active = v.active ? "true" : "false";
       feed.dataset.attention = v.attention ? "true" : "false";
       feed.dataset.post = v.last_post_time || 0;
       setTime(feed.querySelector('[data-field="last_checked"]'), v.last_checked);
